@@ -1,6 +1,6 @@
 <div align="center">
 
-# pyGrater
+# pyGRaTer
 
 **Debris disk modeling and radiative transfer for optically thin media**
 
