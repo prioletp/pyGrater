@@ -1,8 +1,10 @@
+import logging
 #%%
 
 # from pyGrater import grain_temperatures
 from pyGrater import utils as utl 
 from pyGrater.config.paths import DataPathConfig
+from pyGrater.config.logging_config import log_banner
 from scipy.stats import binned_statistic
 
 from pathlib import Path
@@ -19,6 +21,9 @@ from pprint import pformat  # already imported
 from astropy.io import fits
 
 
+
+
+logger = logging.getLogger(__name__)
 class Temperature:
     def __init__(self, grain, star, init_thermal_distance=True, N_temp=300, redo_therm_dist=False, talk=True):
         """
@@ -92,9 +97,10 @@ class Temperature:
         The equilibrium temperature is found by balancing absorbed stellar
         radiation with thermal emission from the grain.
         """
-        print("="*70)
-        print("CREATING TEMPERATURE OBJECT for the grain temperature calculations.")
-        print("="*70)
+        log_banner(
+            logger,
+            "CREATING TEMPERATURE OBJECT for the grain temperature calculations.",
+            width=70)
         self.talk = talk
         self.grain = grain
         self.star = star
@@ -114,8 +120,8 @@ class Temperature:
         
         if redo_therm_dist or not os.path.exists(self.array_path):
             if self.talk:
-                print('Calculating the thermal distance array...')
-                print('Creating file:', self.name_of_array)
+                logger.info('Calculating the thermal distance array...')
+                logger.info('%s %s', 'Creating file:', self.name_of_array)
             self.therm_dist, self.temp_range = utl.calc_therm_dist(grain.Qabs, grain.Qabs_sizes, grain.Qabs_waves,
                                                     star.waves, star.flux,
                                                     grain.Tsub, self.N_temp,
@@ -124,7 +130,7 @@ class Temperature:
                                                     talk=self.talk)
         else:  
             if self.talk:
-                print('Loading the thermal distance array from file:', self.name_of_array)
+                logger.info('%s %s', 'Loading the thermal distance array from file:', self.name_of_array)
             data = np.load(self.array_path)
             self.therm_dist = data['therm_dist']
             self.temp_range = data['temp_range']
@@ -151,7 +157,7 @@ class Temperature:
         if max_dist is None:
             max_dist = np.max(distances_full)     
         
-        print('Plotting temperatures for sizes between', min_size, 'and', max_size, 'between distances', min_dist, 'and', max_dist)
+        logger.info('%s %s %s %s %s %s %s %s', 'Plotting temperatures for sizes between', min_size, 'and', max_size, 'between distances', min_dist, 'and', max_dist)
         idx_sizes =  np.argwhere((sizes_full < max_size) & (sizes_full > min_size)).flatten() 
         idx_distances = np.argwhere((distances_full < max_dist) & (distances_full > min_dist)).flatten()
         

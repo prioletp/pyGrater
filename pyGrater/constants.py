@@ -1,0 +1,20 @@
+"""Shared constants used by pyGrater radiative-transfer calculations."""
+
+# Unit conversions and Planck-function constants.
+MICRON_TO_CM = 1e-4
+PLANCK_C1_CGS = 1.1927e-5
+PLANCK_C2_CM_K = 1.43983
+LIGHT_SPEED_CM_S = 29979245800.0
+MAX_SAFE_EXPONENT = 709.0
+
+# SED spatial integration defaults.
+N_VERTICAL_GRID_POINTS = 401
+MINIMUM_SCALED_HEIGHT = 1e-3
+DEFAULT_DENSITY_CUTOFF = 0.005
+LARGE_WAVELENGTH_GRID_THRESHOLD = 80
+
+# Image spatial integration defaults.
+N_IMAGE_VERTICAL_GRID_POINTS = 401
+MINIMUM_IMAGE_SCALED_HEIGHT = 1e-3
+DEFAULT_IMAGE_PIXEL_SCALE_AU = 0.5
+PIXEL_MAJOR_DENSITY_THRESHOLD = 1_500_000

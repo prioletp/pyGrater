@@ -1,6 +1,10 @@
+import logging
 #%%
 import yaml
 
+
+
+logger = logging.getLogger(__name__)
 data = dict(
     A = 'a',
     B = dict(
@@ -31,7 +35,7 @@ def read_txt_to_dict(filename):
     return col_dict
 
 txt_dict = read_txt_to_dict('/Users/prioletp/PhD/public_codes/pyGrater/parameters/material_list.txt')
-print(txt_dict['Nickname'])
+logger.info(txt_dict['Nickname'])
 
 Weight_par = []
 Weight_per1 = [] #txt_dict['Weight_per1']
@@ -46,18 +50,18 @@ for elem in txt_dict['Weight_per2']:
 
 weights = []
 if len(Weight_par) == len(Weight_per1) == len(Weight_per2):
-    print('All weights have the same length')
+    logger.info('All weights have the same length')
     for index in range(len(Weight_par)):
         weights.append([Weight_par[index], Weight_per1[index], Weight_per2[index]])
 else:
-    print('Weights do not have the same length')
+    logger.info('Weights do not have the same length')
 # print(weights)
 
 dictionary_for_yaml = {}
 for index, nickname in enumerate(txt_dict['Nickname']):
     dictionary_for_yaml[nickname] = weights[index]
 
-print(dictionary_for_yaml)
+logger.info(dictionary_for_yaml)
 with open('weights.yaml', 'w') as outfile:
     yaml.dump(dictionary_for_yaml, outfile, default_flow_style=False)
     

@@ -29,12 +29,16 @@ star, dist, temp, rad, logg, band, apmag
 
 All other fields default to nan / empty string.
 """
+import logging
 
 from pathlib import Path
 import pyGrater
 
 
 # Column order matching stars_main_properties.txt
+
+
+logger = logging.getLogger(__name__)
 _COLUMNS = [
     "star", "dist", "temp", "rad", "mass", "logg",
     "spt", "band", "apmag", "vsini", "mdot", "vw",
@@ -156,7 +160,7 @@ def add_star(
     with open(star_properties_path, "a", encoding="utf-8") as f:
         f.write("\n" + new_row)
 
-    print(f"Star '{star}' added to {star_properties_path}")
+    logger.info(f"Star '{star}' added to {star_properties_path}")
 
 
 # ---------------------------------------------------------------------------

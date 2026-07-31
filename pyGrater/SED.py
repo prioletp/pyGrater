@@ -1,389 +1,671 @@
-#%%
-"""
-SED.py — Optimized SED computation
-===================================================
+"""Fast disk-integrated SEDs for optically thin circumstellar dust.
 
-Key optimizations
------------------
-1. FastFluxes: batch Qabs/Qsca interpolation for ALL wavelengths in one call
-   (eliminates per-wavelength meshgrid + interpolator overhead)
-2. FastFluxes: matrix-multiply (BLAS dgemm) for scattered flux
-   (replaces Python wavelength loop entirely)
-3. FastFluxes: chunked Planck + einsum for thermal flux
-   (replaces Python wavelength loop with vectorised chunks)
-4. SED.get_SED: vectorised radial interpolation via searchsorted
-   (replaces Python loop over wavelengths in interp_axis1)
-5. SED.get_SED: wavelength-chunked interp + integration
-   (bounded peak memory instead of allocating full 3-D arrays)
-6. Removed redundant GrainStar creation in SED.__init__
-7. Eliminated 3-D scattered array (saves GBs of RAM)
-8. Built-in timing profiler for every step
-"""
+``SED`` combines two independent parts of the model:
 
-from pyGrater.utils import (
-    calculate_normalization_density_jacobian,
-    calculate_normalization_density_jacobian_sublimation,
-    calculate_normalization_density_jacobian_sublimation_fast,
-    calculate_normalization_density,
-    get_total_mass_from_normalization_density,
-)
-from pyGrater.fluxes import FastFluxes
+1. The disk density model is integrated over cylindrical radius and height.
+   This produces the amount of density-volume represented at each true
+   stellocentric distance.
+2. Grain radiative transfer supplies thermal dust emission and scattered
+   starlight at those distances.  The two parts are contracted to produce the
+   unresolved spectral energy distribution.
+
+The direct calculation avoids constructing wavelength-by-distance emission
+tables and is the default for fitting.  Explicit distance tables remain
+available for diagnostics and for checking consistency with ``Image``.
+
+Conventions
+-----------
+Wavelengths are in microns, grain sizes in metres, spatial distances in au,
+flux densities in Jy, and returned dust masses in Earth masses.  The model is
+optically thin and the disk-integrated SED uses isotropic scattering.
+"""
+import logging
+
 import time
-import numpy as np
-import scipy
-from pyGrater.phase_functions import isotropic
+
 import astropy.constants as cst
-from scipy.integrate import trapezoid
+import numpy as np
 
-def _trapezoid_weights(x):
-    """Pre-compute composite-trapezoid quadrature weights for a 1-D grid."""
-    dx = np.diff(x)
-    w = np.empty_like(x)
-    w[0]    = dx[0]  / 2.0
-    w[-1]   = dx[-1] / 2.0
-    w[1:-1] = (dx[:-1] + dx[1:]) / 2.0
-    return w
+from pyGrater.constants import (
 
-# ── optional numba acceleration ──────────────────────────────────────────
-try:
+    DEFAULT_DENSITY_CUTOFF,
+    LARGE_WAVELENGTH_GRID_THRESHOLD,
+    MAX_SAFE_EXPONENT,
+    MINIMUM_SCALED_HEIGHT,
+    N_VERTICAL_GRID_POINTS,
+    PLANCK_C2_CM_K,
+)
+from pyGrater.fluxes import (
+    Fluxes,
+    _NUMBA_AVAILABLE,
+    _interp_rows_by_x,
+    _interp_two_regular_grid_2d_with_y,
+    _trapezoid_integration_coefficients,
+)
+from pyGrater.phase_functions import isotropic
+from pyGrater.utils import (
+    calculate_normalization_density_jacobian_sublimation_fast,
+)
+
+
+
+logger = logging.getLogger(__name__)
+if _NUMBA_AVAILABLE:
     from numba import njit, prange
 
+    @njit(cache=True)
+    def _deposit_disk_volume_from_distances(
+            flattened_stellocentric_distance_au, distance_grid_au,
+            vertical_density_volume, radial_integration_coefficients,
+            n_scaled_heights):
+        """Find bins and deposit density-volume in one compiled pass."""
+        output = np.zeros(distance_grid_au.size)
+        minimum_distance = distance_grid_au[0]
+        maximum_distance = distance_grid_au[-1]
+        for radius_index in range(radial_integration_coefficients.size):
+            radial_coefficient = radial_integration_coefficients[radius_index]
+            row_start = radius_index * n_scaled_heights
+            for height_index in range(n_scaled_heights):
+                flat_index = row_start + height_index
+                distance = flattened_stellocentric_distance_au[flat_index]
+                if minimum_distance <= distance <= maximum_distance:
+                    lower_bin = (
+                        np.searchsorted(distance_grid_au, distance) - 1)
+                    if lower_bin < 0:
+                        lower_bin = 0
+                    elif lower_bin >= distance_grid_au.size - 1:
+                        lower_bin = distance_grid_au.size - 2
+                    fraction_above = (
+                        (distance - distance_grid_au[lower_bin])
+                        / (distance_grid_au[lower_bin + 1]
+                           - distance_grid_au[lower_bin]))
+                    contribution = (
+                        vertical_density_volume[flat_index]
+                        * radial_coefficient)
+                    output[lower_bin] += (
+                        contribution * (1.0 - fraction_above))
+                    output[lower_bin + 1] += (
+                        contribution * fraction_above)
+        return output
+
+    # Direct SED path for small and medium W: integrate Planck emission over
+    # distance and grain size without constructing emission-by-distance arrays.
     @njit(parallel=True, cache=True)
-    def _planck_thermal_fused(wav_cm, log5_lam, c1Cbb, lam5,
-                              temperatures, temp_ok, coeff, inv_d2):
-        """Fully fused thermal flux: Planck + size-integral, no 3-D intermediates."""
-        N_wav = wav_cm.shape[0]
-        N_s, N_d = temperatures.shape
-        flux = np.empty((N_wav, N_d))
-        for w in prange(N_wav):
-            lc = wav_cm[w]
-            ll = log5_lam[w]
-            cc = c1Cbb[w]
-            l5 = lam5[w]
-            for d in range(N_d):
-                acc = 0.0
-                for s in range(N_s):
-                    if temp_ok[s, d]:
-                        x = 1.43983 / (lc * temperatures[s, d]) + ll
-                        if x > 709.0:
-                            continue  # bb ≈ 0, skip
-                        acc += cc / (np.exp(x) - l5) * coeff[s, w]
-                flux[w, d] = acc * inv_d2
-        return flux
+    def _integrated_dust_thermal_emission(
+            wavelength_cm, five_log_wavelength_cm,
+            wavelength_cm_fifth_power, planck_to_jy_prefactor,
+            grain_temperatures, grains_survive, absorption_cross_section,
+            disk_density_volume_by_distance,
+            inverse_observer_distance_squared):
+        n_wavelengths = wavelength_cm.shape[0]
+        n_grain_sizes, n_distances = grain_temperatures.shape
+        dust_thermal_sed = np.empty(n_wavelengths)
+        for wavelength_index in prange(n_wavelengths):
+            current_wavelength_cm = wavelength_cm[wavelength_index]
+            current_five_log_wavelength = (
+                five_log_wavelength_cm[wavelength_index])
+            current_wavelength_fifth_power = (
+                wavelength_cm_fifth_power[wavelength_index])
+            current_planck_prefactor = (
+                planck_to_jy_prefactor[wavelength_index])
+            emission_at_wavelength = 0.0
+            for grain_size_index in range(n_grain_sizes):
+                current_absorption_cross_section = absorption_cross_section[
+                    grain_size_index, wavelength_index]
+                emission_for_grain_size = 0.0
+                for distance_index in range(n_distances):
+                    if grains_survive[grain_size_index, distance_index]:
+                        exponent = (
+                            PLANCK_C2_CM_K
+                            / (current_wavelength_cm
+                               * grain_temperatures[
+                                   grain_size_index, distance_index])
+                            + current_five_log_wavelength)
+                        if exponent <= MAX_SAFE_EXPONENT:
+                            emission_for_grain_size += (
+                                current_planck_prefactor
+                                / (np.exp(exponent)
+                                   - current_wavelength_fifth_power)
+                                * disk_density_volume_by_distance[
+                                    distance_index])
+                emission_at_wavelength += (
+                    current_absorption_cross_section
+                    * emission_for_grain_size)
+            dust_thermal_sed[wavelength_index] = (
+                emission_at_wavelength * inverse_observer_distance_squared)
+        return dust_thermal_sed
 
-    _NUMBA_AVAILABLE = True
-
+    # Direct SED path for large W: expose wavelength x grain-size jobs to
+    # Numba, then finish the grain-size integral with NumPy.
     @njit(parallel=True, cache=True)
-    def _interp_zeta_integral(flux, idx, w_frac, w1_frac, ib,
-                              geo_zw, N_r, N_zeta):
-        """Fused interpolation + ζ-integration for all wavelengths at once."""
-        N_wav = flux.shape[0]
-        out = np.empty((N_wav, N_r))
-        for i_w in prange(N_wav):
-            for i_r in range(N_r):
-                acc = 0.0
-                base = i_r * N_zeta
-                for i_z in range(N_zeta):
-                    k = base + i_z
-                    if ib[k]:
-                        val = (flux[i_w, idx[k]] * w1_frac[k]
-                               + flux[i_w, idx[k] + 1] * w_frac[k])
-                        acc += val * geo_zw[k]
-                out[i_w, i_r] = acc
-        return out
-except ImportError:
-    _NUMBA_AVAILABLE = False
+    def _planck_emission_integrated_over_disk(
+            wavelength_cm, five_log_wavelength_cm,
+            wavelength_cm_fifth_power, planck_to_jy_prefactor,
+            grain_temperatures, grains_survive,
+            disk_density_volume_by_distance):
+        n_wavelengths = wavelength_cm.shape[0]
+        n_grain_sizes, n_distances = grain_temperatures.shape
+        emission_by_wavelength_and_size = np.empty(
+            (n_wavelengths, n_grain_sizes))
+        for job_index in prange(n_wavelengths * n_grain_sizes):
+            wavelength_index = job_index // n_grain_sizes
+            grain_size_index = job_index - wavelength_index * n_grain_sizes
+            current_wavelength_cm = wavelength_cm[wavelength_index]
+            current_five_log_wavelength = (
+                five_log_wavelength_cm[wavelength_index])
+            current_wavelength_fifth_power = (
+                wavelength_cm_fifth_power[wavelength_index])
+            current_planck_prefactor = (
+                planck_to_jy_prefactor[wavelength_index])
+            emission_for_grain_size = 0.0
+            for distance_index in range(n_distances):
+                if grains_survive[grain_size_index, distance_index]:
+                    exponent = (
+                        PLANCK_C2_CM_K
+                        / (current_wavelength_cm
+                           * grain_temperatures[
+                               grain_size_index, distance_index])
+                        + current_five_log_wavelength)
+                    if exponent <= MAX_SAFE_EXPONENT:
+                        emission_for_grain_size += (
+                            current_planck_prefactor
+                            / (np.exp(exponent)
+                               - current_wavelength_fifth_power)
+                            * disk_density_volume_by_distance[distance_index])
+            emission_by_wavelength_and_size[
+                wavelength_index, grain_size_index] = emission_for_grain_size
+        return emission_by_wavelength_and_size
 
-
-# ── helpers ──────────────────────────────────────────────────────────────
-
-
-
-
-
-
-# ── SED ──────────────────────────────────────────────────────────────────
 
 class SED:
+    """Calculate thermal and scattered-light disk SEDs quickly."""
+
     def __init__(self, grain, star, density_function,
                  size_distribution_function, wavelengths_for_calc,
-                 N_distances=8000):
+                 N_distances=800):
         self.grain = grain
-        self.star  = star
+        self.star = star
         self.density_function = density_function
         self.size_distribution_function = size_distribution_function
-        self.scattering_phase_function  = isotropic
-
-        self.flux_obj = FastFluxes(
-            grain, star, wavelengths_for_calc,
+        self.scattering_phase_function = isotropic
+        self.model_wavelengths_micron = np.asarray(
+            wavelengths_for_calc, dtype=np.float64)
+        self.radiative_transfer = Fluxes(
+            grain, star, self.model_wavelengths_micron,
             size_distribution_function, isotropic,
             N_distances=N_distances)
-        self.wavelengths_for_calc = wavelengths_for_calc
-        self.distances_for_flux   = self.flux_obj.distances_for_flux
-        self.scattering_angles    = self.flux_obj.scattering_angles
+        self.absorption_efficiency_grid = (
+            self.radiative_transfer.absorption_efficiency_grid)
+        self.scattering_efficiency_grid = (
+            self.radiative_transfer.scattering_efficiency_grid)
+        self.optical_property_grain_sizes_micron = (
+            self.radiative_transfer.optical_property_grain_sizes_micron)
+        self.temperature_model = self.radiative_transfer.temperature_model
+        self.sublimation_temperature_k = (
+            self.radiative_transfer.sublimation_temperature_k)
+        self.stellocentric_distances_au = (
+            self.radiative_transfer.stellocentric_distances_au)
+        self.grain_temperatures_by_size_and_distance = (
+            self.radiative_transfer.grain_temperatures_by_size_and_distance)
+        self.sizes_for_integral = None
+        self.radiative_transfer_timings = (
+            self.radiative_transfer.timings)
 
-        # NOTE: redundant GrainStar removed (Fluxes already creates one)
+        half_vertical_grid = (N_VERTICAL_GRID_POINTS - 1) // 2
+        positive_scaled_heights = np.geomspace(
+            MINIMUM_SCALED_HEIGHT, 1.0, half_vertical_grid)
+        self.scaled_vertical_coordinate = np.concatenate(
+            (-positive_scaled_heights[::-1], [0.0],
+             positive_scaled_heights))
+        self.vertical_integration_coefficients = (
+            _trapezoid_integration_coefficients(
+                self.scaled_vertical_coordinate))
 
-        # Normalised vertical coordinate ζ ∈ [-1, 1]
-        N_zeta   = 401
-        half     = (N_zeta - 1) // 2
-        positive = np.geomspace(1e-3, 1.0, half)
-        self.zeta = np.concatenate((-positive[::-1], [0.0], positive))
+        self.timings = {}
 
-    # ---- z-grid construction ----------------------------------------
-    def _build_z_grid(self, kwargs):
-        r = self.radial_distances
-        Z_max_r = self.Z0 * np.sqrt(1 + r**2 / self.rmax**2)
-        z_2d    = Z_max_r[:, None] * self.zeta[None, :]
-        R_sph   = np.sqrt(r[:, None]**2 + z_2d**2)
-        return z_2d, Z_max_r, R_sph
+    def _build_vertical_grid(self, cylindrical_radius_au):
+        """Return height, maximum height, and true distance on the disk grid."""
+        maximum_height_au = self.vertical_grid_scale_au * np.sqrt(
+            1 + cylindrical_radius_au**2 / self.maximum_disk_radius_au**2)
+        height_above_midplane_au = (
+            maximum_height_au[:, None]
+            * self.scaled_vertical_coordinate[None, :])
+        stellocentric_distance_au = np.sqrt(
+            cylindrical_radius_au[:, None]**2
+            + height_above_midplane_au**2)
+        return (height_above_midplane_au, maximum_height_au,
+                stellocentric_distance_au)
 
-    # ---- shared parameter setup -------------------------------------
-    def _setup_grid(self, kwargs):
-        """Compute radial grid, Z0, and clipped z / R arrays."""
-        r0       = kwargs['r0']
-        alphain  = kwargs['alphain']
-        beta     = kwargs['beta']
-        gamma    = kwargs['gamma']
-        h0       = kwargs['h0']
-        alphaout = kwargs['alphaout']
-        p        = kwargs.get('p_cutoff', 0.005)
+    def _build_spatial_integration_grid(self, model_parameters):
+        """Construct the cylindrical disk grid used for density integration."""
+        reference_radius_au = model_parameters['r0']
+        inner_slope = model_parameters['alphain']
+        outer_slope = model_parameters['alphaout']
+        flaring_exponent = model_parameters['beta']
+        vertical_exponent = model_parameters['gamma']
+        scale_height_at_reference_radius_au = model_parameters['h0']
+        
+        
+        density_cutoff = model_parameters.get(
+            'p_cutoff', DEFAULT_DENSITY_CUTOFF)
+        maximum_disk_radius_au = model_parameters.get(
+            'rmax', reference_radius_au * density_cutoff ** (1.0 / outer_slope))
+        
+        self.maximum_disk_radius_au = maximum_disk_radius_au
+        cylindrical_radius_au = np.geomspace(
+            self.stellocentric_distances_au.min(), maximum_disk_radius_au,
+            len(self.stellocentric_distances_au))
 
-        rmax = r0 * p ** (1.0 / alphaout)
-        self.rmax = rmax
+        effective_inner_slope = inner_slope + flaring_exponent
+        effective_outer_slope = outer_slope + flaring_exponent
+        peak_radius_au = (
+            -effective_inner_slope / effective_outer_slope
+        ) ** (1.0 / (2 * effective_inner_slope
+                     - 2 * effective_outer_slope)) * reference_radius_au
+        height_at_peak_radius_au = (
+            scale_height_at_reference_radius_au
+            * (peak_radius_au / reference_radius_au)**flaring_exponent
+            * np.log(1.0 / density_cutoff)**(1.0 / vertical_exponent))
+        self.vertical_grid_scale_au = height_at_peak_radius_au / np.sqrt(
+            peak_radius_au**2 / maximum_disk_radius_au**2 + 1)
 
-        r = np.geomspace(self.distances_for_flux.min(), rmax,
-                         len(self.distances_for_flux))
-        self.radial_distances = r
+        (height_above_midplane_au, maximum_height_au,
+         stellocentric_distance_au) = self._build_vertical_grid(
+            cylindrical_radius_au)
+        return (cylindrical_radius_au, height_above_midplane_au,
+                maximum_height_au, stellocentric_distance_au)
 
-        g_in  = alphain  + beta
-        g_out = alphaout + beta
-        r_pk  = (-g_in / g_out) ** (1.0 / (2*g_in - 2*g_out)) * r0
-        z_pk  = (h0 * (r_pk / r0)**beta) * (np.log(1.0 / p) ** (1.0 / gamma))
-        self.Z0 = z_pk / np.sqrt(r_pk**2 / rmax**2 + 1)
+    def get_total_mass(self, **model_parameters):
+        """Return the dust mass in Earth masses for the supplied normalization.
 
-        r_mask = r <= rmax
-        d_clip = r[r_mask]
+        If ``M_tot`` is supplied, it is already the requested mass and is
+        returned directly.  Otherwise the method integrates the density and
+        grain-size distributions corresponding to ``A_norm`` while excluding
+        grains above their sublimation temperature.
+        """
+        if 'M_tot' in model_parameters:
+            return float(model_parameters['M_tot'])
+        normalization_constant = model_parameters.get('A_norm', None)
+        if normalization_constant is None:
+            raise ValueError('get_total_mass requires either A_norm or M_tot.')
 
-        z_full, Zm_full, R_full = self._build_z_grid(kwargs)
-        z_clip  = z_full[r_mask]
-        Zm_clip = Zm_full[r_mask]
-        R_clip  = R_full[r_mask]
-        del z_full, Zm_full, R_full
-        return d_clip, r_mask, z_clip, Zm_clip, R_clip
+        grain_sizes_m = np.geomspace(
+            model_parameters['a_min'], model_parameters['a_max'],
+            model_parameters['N_sizes_integral'])
+        self.sizes_for_integral = grain_sizes_m
+        grain_bulk_density_kg_m3 = (
+            self.grain.grain_properties['Density'] * 1000)
+        (cylindrical_radius_au, height_above_midplane_au,
+         maximum_height_au, stellocentric_distance_au) = (
+            self._build_spatial_integration_grid(model_parameters))
+        if self.maximum_disk_radius_au <= self.stellocentric_distances_au[0]:
+            # The modeled disk ends before this composition has any tabulated
+            # surviving grains. Integrating a descending radial grid would
+            # create a small, unphysical negative mass.
+            return 0.0
 
-    # ---- total mass -------------------------------------------------
-    def get_total_mass(self, **kwargs):
-        normalization_constant = kwargs.get('A_norm', None)
-        sizes         = self.flux_obj.sizes_for_integral
-        grain_density = self.grain.grain_properties['Density'] * 1000
+        cylindrical_radius_column_au = cylindrical_radius_au[:, None]
+        relative_number_density = self.density_function(
+            cylindrical_radius_column_au, 0., height_above_midplane_au,
+            model_parameters)
+        density_times_cylindrical_volume = (
+            relative_number_density
+            * 2.0 * np.pi * cylindrical_radius_column_au
+            * maximum_height_au[:, None])
+        vertical_density_volume = (
+            density_times_cylindrical_volume
+            * self.vertical_integration_coefficients[None, :]).ravel()
+        radial_integration_coefficients = (
+            _trapezoid_integration_coefficients(cylindrical_radius_au))
+        disk_density_volume_by_distance = (
+            self._disk_density_volume_by_stellocentric_distance(
+                cylindrical_radius_au, stellocentric_distance_au,
+                vertical_density_volume,
+                radial_integration_coefficients))
 
-        d_clip, _, z_clip, Zm_clip, _ = self._setup_grid(kwargs)
-
-        total_mass = get_total_mass_from_normalization_density(
-            normalization_constant, sizes, d_clip, z_clip, Zm_clip,
-            self.zeta, grain_density, self.density_function, kwargs,
-            self.size_distribution_function, kwargs)
+        grain_temperatures = _interp_rows_by_x(
+            self.optical_property_grain_sizes_micron,
+            self.grain_temperatures_by_size_and_distance,
+            grain_sizes_m / 1e-6)
+        grains_survive = (
+            grain_temperatures <= self.sublimation_temperature_k)
+        size_distribution = self.size_distribution_function(
+            grain_sizes_m, model_parameters)
+        grain_mass_distribution = (
+            (4.0 * np.pi / 3.0) * grain_bulk_density_kg_m3 * grain_sizes_m**3
+            * size_distribution
+            * _trapezoid_integration_coefficients(grain_sizes_m))
+        surviving_disk_volume_by_size = (
+            grains_survive @ disk_density_volume_by_distance)
+        total_mass = normalization_constant * np.dot(
+            grain_mass_distribution, surviving_disk_volume_by_size)
         return total_mass / cst.M_earth.value
 
-    # =================================================================
-    #                           get_SED
-    # =================================================================
+    def _disk_density_volume_by_stellocentric_distance(
+            self, cylindrical_radius_au, stellocentric_distance_au,
+            vertical_density_volume,
+            radial_integration_coefficients):
+        """Deposit every cylindrical grid cell into true-distance bins.
+
+        A cell generally lies between two tabulated stellocentric distances.
+        Its density-volume contribution is therefore divided linearly between
+        those adjacent bins.  The result has shape ``(D,)``.
+        """
+        flattened_stellocentric_distance_au = (
+            stellocentric_distance_au.ravel())
+        distance_grid_au = self.stellocentric_distances_au
+        if _NUMBA_AVAILABLE:
+            return _deposit_disk_volume_from_distances(
+                np.ascontiguousarray(flattened_stellocentric_distance_au),
+                np.ascontiguousarray(distance_grid_au),
+                np.ascontiguousarray(vertical_density_volume),
+                np.ascontiguousarray(radial_integration_coefficients),
+                len(self.scaled_vertical_coordinate))
+
+        lower_distance_bin = np.searchsorted(
+            distance_grid_au, flattened_stellocentric_distance_au) - 1
+        lower_distance_bin = np.clip(
+            lower_distance_bin, 0, len(distance_grid_au) - 2)
+        inside_distance_grid = (
+            (flattened_stellocentric_distance_au >= distance_grid_au[0])
+            & (flattened_stellocentric_distance_au <= distance_grid_au[-1]))
+        fraction_above = (
+            (flattened_stellocentric_distance_au
+             - distance_grid_au[lower_distance_bin])
+            / (distance_grid_au[lower_distance_bin + 1]
+               - distance_grid_au[lower_distance_bin]))
+        fraction_below = 1.0 - fraction_above
+        density_volume_at_grid_points = (
+            vertical_density_volume
+            * np.repeat(radial_integration_coefficients,
+                        len(self.scaled_vertical_coordinate)))
+        disk_density_volume_by_distance = np.bincount(
+            lower_distance_bin[inside_distance_grid],
+            weights=(density_volume_at_grid_points[inside_distance_grid]
+                     * fraction_below[inside_distance_grid]),
+            minlength=len(distance_grid_au))
+        disk_density_volume_by_distance += np.bincount(
+            lower_distance_bin[inside_distance_grid] + 1,
+            weights=(density_volume_at_grid_points[inside_distance_grid]
+                     * fraction_above[inside_distance_grid]),
+            minlength=len(distance_grid_au))
+        return disk_density_volume_by_distance
+
+    def calculate_disk_integrated_sed(
+            self, model_parameters, disk_density_volume_by_distance,
+            keep_separate_fluxes):
+        """Calculate the SED without constructing emission-by-distance arrays.
+
+        This is the optimized fitting path.  Thermal emission is contracted
+        directly over grain size and stellocentric distance.  Scattered light
+        is contracted through the total illuminated grain cross section.
+        """
+        t0 = time.perf_counter()
+        radiative_transfer = self.radiative_transfer
+        grain_sizes_m = np.geomspace(
+            model_parameters['a_min'], model_parameters['a_max'],
+            model_parameters['N_sizes_integral'])
+        self.sizes_for_integral = grain_sizes_m
+        radiative_transfer.sizes_for_integral = grain_sizes_m
+
+        size_distribution = self.size_distribution_function(
+            grain_sizes_m, model_parameters)
+        grain_cross_section_distribution = (
+            np.pi * grain_sizes_m**2 * size_distribution)
+        grain_size_integration_coefficients = (
+            _trapezoid_integration_coefficients(grain_sizes_m))
+        grain_temperatures = _interp_rows_by_x(
+            self.optical_property_grain_sizes_micron,
+            self.grain_temperatures_by_size_and_distance,
+            grain_sizes_m / 1e-6)
+        grains_below_sublimation_temperature = (
+            grain_temperatures <= self.sublimation_temperature_k)
+        t_temperatures = time.perf_counter()
+
+        absorption_efficiency, scattering_efficiency = (
+            _interp_two_regular_grid_2d_with_y(
+                self.optical_property_grain_sizes_micron,
+                self.absorption_efficiency_grid,
+                self.scattering_efficiency_grid,
+                grain_sizes_m / 1e-6,
+                radiative_transfer._optical_wavelength_grid_index,
+                radiative_transfer
+                ._optical_wavelength_interpolation_fraction))
+        t_optical_efficiencies = time.perf_counter()
+
+        absorption_cross_section_by_size_and_wavelength = (
+            absorption_efficiency
+            * (grain_cross_section_distribution
+               * grain_size_integration_coefficients)[:, None])
+        disk_density_volume_by_distance = np.ascontiguousarray(
+            disk_density_volume_by_distance)
+
+        if (_NUMBA_AVAILABLE
+                and len(self.model_wavelengths_micron)
+                >= LARGE_WAVELENGTH_GRID_THRESHOLD):
+            planck_emission_integrated_over_disk = (
+                _planck_emission_integrated_over_disk(
+                    radiative_transfer._wavelength_cm,
+                    radiative_transfer._five_log_wavelength_cm,
+                    radiative_transfer._wavelength_cm_fifth_power,
+                    radiative_transfer._planck_to_jy_prefactor,
+                    np.ascontiguousarray(grain_temperatures),
+                    np.ascontiguousarray(
+                        grains_below_sublimation_temperature),
+                    disk_density_volume_by_distance))
+            dust_thermal_sed = np.sum(
+                planck_emission_integrated_over_disk
+                * absorption_cross_section_by_size_and_wavelength.T,
+                axis=1)
+            dust_thermal_sed *= (
+                radiative_transfer._inverse_observer_distance_squared_m2)
+        elif _NUMBA_AVAILABLE:
+            dust_thermal_sed = _integrated_dust_thermal_emission(
+                radiative_transfer._wavelength_cm,
+                radiative_transfer._five_log_wavelength_cm,
+                radiative_transfer._wavelength_cm_fifth_power,
+                radiative_transfer._planck_to_jy_prefactor,
+                np.ascontiguousarray(grain_temperatures),
+                np.ascontiguousarray(grains_below_sublimation_temperature),
+                np.ascontiguousarray(
+                    absorption_cross_section_by_size_and_wavelength),
+                disk_density_volume_by_distance,
+                radiative_transfer._inverse_observer_distance_squared_m2)
+        else:
+            wavelength_cm = self.model_wavelengths_micron * 1e-4
+            planck_emission = (
+                radiative_transfer._planck_to_jy_prefactor[:, None, None]
+                / (
+                np.exp(np.minimum(
+                    1.43983 / (wavelength_cm[:, None, None]
+                               * grain_temperatures[None, :, :])
+                    + 5.0 * np.log(wavelength_cm)[:, None, None], 709.0))
+                - wavelength_cm[:, None, None]**5))
+            planck_emission *= (
+                grains_below_sublimation_temperature[None, :, :])
+            dust_thermal_sed = np.einsum(
+                'wsd,sw,d->w', planck_emission,
+                absorption_cross_section_by_size_and_wavelength,
+                disk_density_volume_by_distance)
+            dust_thermal_sed *= (
+                radiative_transfer._inverse_observer_distance_squared_m2)
+
+        t_dust_thermal_emission = time.perf_counter()
+        stellar_illumination_by_distance = (
+            disk_density_volume_by_distance
+            / radiative_transfer._stellocentric_distance_squared_m2)
+        scattering_cross_section_by_size = (
+            grain_cross_section_distribution
+            * grain_size_integration_coefficients
+            * (grains_below_sublimation_temperature
+               @ stellar_illumination_by_distance))
+        scattered_starlight_sed = (
+            scattering_efficiency.T @ scattering_cross_section_by_size)
+        scattered_starlight_sed *= (
+            radiative_transfer._stellar_flux_at_model_wavelengths)
+        scattered_starlight_sed *= self.scattering_phase_function(
+            radiative_transfer._zero_scattering_angle_radian,
+            **model_parameters)[0]
+        t_end = time.perf_counter()
+
+        self.radiative_transfer_timings['dust_temperature_interpolation'] = (
+            t_temperatures - t0)
+        self.radiative_transfer_timings['optical_efficiency_interpolation'] = (
+            t_optical_efficiencies - t_temperatures)
+        self.radiative_transfer_timings[
+            'planck_emission_and_grain_size_integration'] = (
+            t_dust_thermal_emission - t_optical_efficiencies)
+        self.radiative_transfer_timings['dust_thermal_emission_total'] = (
+            t_dust_thermal_emission - t0)
+        self.radiative_transfer_timings[
+            'scattered_starlight_grain_size_integration'] = (
+            t_end - t_dust_thermal_emission)
+        self.radiative_transfer_timings['scattered_starlight_total'] = (
+            t_end - t_dust_thermal_emission)
+
+        if keep_separate_fluxes:
+            return dust_thermal_sed, scattered_starlight_sed
+        dust_thermal_sed += scattered_starlight_sed
+        return dust_thermal_sed
+
+    def calculate_emission_by_stellocentric_distance(self, model_parameters):
+        """Return diagnostic ``(thermal, scattered)`` arrays of shape ``(W,D)``."""
+        result = (self.radiative_transfer
+                  .calculate_emission_by_stellocentric_distance(
+                      model_parameters))
+        self.sizes_for_integral = self.radiative_transfer.sizes_for_integral
+        return result
+
     def get_SED(self, keep_separate_fluxes=False,
-                verbose_timing=False, **kwargs):
-        """SED computation with vectorised operations and bounded memory.
+                verbose_timing=False, return_emission_by_distance=False,
+                **model_parameters):
+        """Calculate the fastest disk-integrated SED.
 
         Parameters
         ----------
         keep_separate_fluxes : bool
-            If True, return (thermal, scattered) tuple.
+            If true, return ``(dust_thermal_sed, scattered_starlight_sed)``.
+            Otherwise return their sum.
         verbose_timing : bool
-            If True, print a timing breakdown of each step.
-        **kwargs
-            Disk model parameters (r0, h0, alphain, …).
+            Print the measured runtime of each major calculation stage.
+        return_emission_by_distance : bool
+            Also return the unnormalized thermal and scattered-light arrays as
+            functions of wavelength and stellocentric distance.
+        **model_parameters
+            Disk-density and grain-size-distribution parameters, including
+            either ``A_norm`` or ``M_tot``.
 
         Returns
         -------
-        SED or (SED_thermal, SED_scattered)
+        With ``return_emission_by_distance=False``, return the normalized SED.
+        With it enabled, return
+        ``(sed_result, dust_thermal_emission_by_distance,
+        scattered_starlight_by_distance)``.  The distance-resolved arrays have
+        shape ``(W, D)`` and do not include ``A_norm`` or mass normalization.
         """
-        import gc
         timings = {}
+        total_start = time.perf_counter()
+        (cylindrical_radius_au, height_above_midplane_au,
+         maximum_height_au, stellocentric_distance_au) = (
+            self._build_spatial_integration_grid(model_parameters))
+        grid_ready = time.perf_counter()
+        timings['grid_setup'] = grid_ready - total_start
 
-        # ---- 1. Flux computation (thermal + scattered) ---------------
-        t0 = time.perf_counter()
-        thermal_flux, scat_3d = self.flux_obj.get_fluxes(kwargs)
-        scattered_flux = scat_3d[:, :, 0]
-        del scat_3d
-        t1 = time.perf_counter()
-        timings['get_fluxes'] = t1 - t0
+        density_start = time.perf_counter()
+        cylindrical_radius_column_au = cylindrical_radius_au[:, None]
+        relative_number_density = self.density_function(
+            cylindrical_radius_column_au, 0., height_above_midplane_au,
+            model_parameters)
+        density_times_cylindrical_volume = (
+            relative_number_density
+            * 2.0 * np.pi * cylindrical_radius_column_au
+            * maximum_height_au[:, None])
+        del relative_number_density
+        density_ready = time.perf_counter()
+        timings['density'] = density_ready - density_start
 
-        # ---- 2. Grid setup ------------------------------------------
-        sizes         = self.flux_obj.sizes_for_integral
-        grain_density = self.grain.grain_properties['Density'] * 1000
+        spatial_integration_start = time.perf_counter()
+        vertical_density_volume = (
+            density_times_cylindrical_volume
+            * self.vertical_integration_coefficients[None, :]).ravel()
+        radial_integration_coefficients = (
+            _trapezoid_integration_coefficients(cylindrical_radius_au))
+        disk_density_volume_by_distance = (
+            self._disk_density_volume_by_stellocentric_distance(
+                cylindrical_radius_au, stellocentric_distance_au,
+                vertical_density_volume,
+                radial_integration_coefficients))
+        del (density_times_cylindrical_volume, stellocentric_distance_au,
+             vertical_density_volume,
+             radial_integration_coefficients)
+        spatial_integration_ready = time.perf_counter()
+        timings['disk_density_volume_by_distance'] = (
+            spatial_integration_ready - spatial_integration_start)
 
-        t2 = time.perf_counter()
-        d_clip, r_mask, z_clip, Zm_clip, R_clip = self._setup_grid(kwargs)
-        t3 = time.perf_counter()
-        timings['grid_setup'] = t3 - t2
+        radiative_transfer_start = time.perf_counter()
+        unnormalized_sed = self.calculate_disk_integrated_sed(
+            model_parameters, disk_density_volume_by_distance,
+            keep_separate_fluxes)
+        emission_by_distance = None
+        if return_emission_by_distance:
+            emission_by_distance = (
+                self.calculate_emission_by_stellocentric_distance(
+                    model_parameters))
+        radiative_transfer_ready = time.perf_counter()
+        timings['radiative_transfer'] = (
+            radiative_transfer_ready - radiative_transfer_start)
 
-        # ---- 3. Normalisation ----------------------------------------
-        t4 = time.perf_counter()
-        r_2d = d_clip[:, None] * np.ones_like(z_clip)
-        if 'M_tot' in kwargs:
-            M_tot = kwargs['M_tot'] * cst.M_earth.value
-            norm_factor = calculate_normalization_density_jacobian_sublimation_fast(
-                self.flux_obj.stargrain_obj,
-                M_tot, sizes, d_clip, z_clip, Zm_clip, self.zeta,
-                grain_density, self.density_function, kwargs,
-                self.size_distribution_function, kwargs)
+        normalization_start = time.perf_counter()
+        if 'M_tot' in model_parameters:
+            grain_bulk_density_kg_m3 = (
+                self.grain.grain_properties['Density'] * 1000)
+            total_mass_kg = model_parameters['M_tot'] * cst.M_earth.value
+            density_normalization = (
+                calculate_normalization_density_jacobian_sublimation_fast(
+                self.temperature_model,
+                total_mass_kg, self.sizes_for_integral,
+                cylindrical_radius_au, height_above_midplane_au,
+                maximum_height_au,
+                self.scaled_vertical_coordinate,
+                grain_bulk_density_kg_m3, self.density_function,
+                model_parameters, self.size_distribution_function,
+                model_parameters))
         else:
-            norm_factor = kwargs['A_norm']
-        self.norm_factor = norm_factor
-        t5 = time.perf_counter()
-        timings['normalisation'] = t5 - t4
+            density_normalization = model_parameters['A_norm']
+        self.density_normalization = density_normalization
+        del height_above_midplane_au, maximum_height_au
+        normalization_ready = time.perf_counter()
+        timings['normalisation'] = normalization_ready - normalization_start
 
-        # print(f'rmax={self.rmax:.4f} AU')
-
-        # ---- 4. Density & geometric factor ---------------------------
-        t6 = time.perf_counter()
-        density = self.density_function(r_2d, 0., z_clip, kwargs)
-        geo = density * 2.0 * np.pi * d_clip[:, None] * Zm_clip[:, None]
-        del density, Zm_clip, z_clip, r_2d
-        t7 = time.perf_counter()
-        timings['density'] = t7 - t6
-
-        # ---- 5. Numba-fused interp + ζ-integration --------------------
-        t8 = time.perf_counter()
-
-        # Pre-compute interpolation indices & weights ONCE
-        R_flat  = R_clip.ravel()
-        x_src   = self.distances_for_flux
-        idx_arr = np.searchsorted(x_src, R_flat) - 1
-        idx_arr = np.clip(idx_arr, 0, len(x_src) - 2)
-        ib      = (R_flat >= x_src[0]) & (R_flat <= x_src[-1])
-        frac    = (R_flat - x_src[idx_arr]) / (x_src[idx_arr + 1] - x_src[idx_arr])
-        frac1   = 1.0 - frac
-        del R_flat, R_clip
-
-        N_r    = len(d_clip)
-        N_zeta = len(self.zeta)
-
-        # Pre-compute ζ trapezoid weights × geometric factor
-        zeta_w = _trapezoid_weights(self.zeta)
-        geo_zw = (geo * zeta_w[None, :]).ravel()          # (N_r * N_zeta,)
-        del geo
-
-        if _NUMBA_AVAILABLE:
-            # Fused parallel kernel — no large intermediates
-            idx_c  = np.ascontiguousarray(idx_arr.astype(np.intp))
-            frac_c = np.ascontiguousarray(frac)
-            frc1_c = np.ascontiguousarray(frac1)
-            ib_c   = np.ascontiguousarray(ib)
-            gzw_c  = np.ascontiguousarray(geo_zw)
-            th_c   = np.ascontiguousarray(thermal_flux)
-            sc_c   = np.ascontiguousarray(scattered_flux)
-            zeta_th = _interp_zeta_integral(th_c, idx_c, frac_c, frc1_c,
-                                             ib_c, gzw_c, N_r, N_zeta)
-            zeta_sc = _interp_zeta_integral(sc_c, idx_c, frac_c, frc1_c,
-                                             ib_c, gzw_c, N_r, N_zeta)
-            del th_c, sc_c
-        else:
-            # Numpy fallback: chunked loop (geo_zw already has ζ weights)
-            N_wav  = len(self.wavelengths_for_calc)
-            zeta_th = np.zeros((N_wav, N_r))
-            zeta_sc = np.zeros((N_wav, N_r))
-            geo_2d = geo_zw.reshape(N_r, N_zeta)             # (N_r, N_zeta)
-            CHUNK = 50
-            for i0 in range(0, N_wav, CHUNK):
-                i1 = min(i0 + CHUNK, N_wav)
-                th = thermal_flux[i0:i1, idx_arr] * frac1 + \
-                     thermal_flux[i0:i1, idx_arr + 1] * frac
-                th[:, ~ib] = 0.0
-                th = th.reshape(i1 - i0, N_r, N_zeta)
-                sc = scattered_flux[i0:i1, idx_arr] * frac1 + \
-                     scattered_flux[i0:i1, idx_arr + 1] * frac
-                sc[:, ~ib] = 0.0
-                sc = sc.reshape(i1 - i0, N_r, N_zeta)
-                # geo_zw already includes ζ trap weights → just sum
-                zeta_th[i0:i1] = np.sum(th * geo_2d[None], axis=2)
-                zeta_sc[i0:i1] = np.sum(sc * geo_2d[None], axis=2)
-                del th, sc
-
-        del idx_arr, frac, frac1, ib, geo_zw, thermal_flux, scattered_flux
-        t9 = time.perf_counter()
-        timings['interp+zeta_int'] = t9 - t8
-
-        # ---- 6. Radial integration -----------------------------------
-        t10 = time.perf_counter()
-        SED_therm = scipy.integrate.trapezoid(zeta_th, x=d_clip, axis=1)
-        SED_sca   = scipy.integrate.trapezoid(zeta_sc, x=d_clip, axis=1)
-        del zeta_th, zeta_sc
-        t11 = time.perf_counter()
-        timings['radial_int'] = t11 - t10
-
-        gc.collect()
-        timings['total'] = t11 - t0
-
-        # Merge sub-timings from FastFluxes
-        timings.update(self.flux_obj.flux_timings)
+        timings['total'] = normalization_ready - total_start
+        timings.update(self.radiative_transfer_timings)
+        self.timings = timings
 
         if verbose_timing:
-            print('\n=== SED timing breakdown ===')
+            logger.info('\n=== SED timing breakdown ===')
             for k, v in timings.items():
                 pct = v / timings['total'] * 100
-                print(f'  {k:30s}: {v:8.3f} s  ({pct:5.1f}%)')
-            print('============================\n')
+                logger.info(f'  {k:30s}: {v:8.3f} s  ({pct:5.1f}%)')
+            logger.info('============================\n')
 
-        self.timings = timings
         if keep_separate_fluxes:
-            self.SED_therm = SED_therm
-            self.SED_sca   = SED_sca
-            return SED_therm * norm_factor, SED_sca * norm_factor
+            (unnormalized_dust_thermal_sed,
+             unnormalized_scattered_starlight_sed) = unnormalized_sed
+            result = (
+                unnormalized_dust_thermal_sed * density_normalization,
+                unnormalized_scattered_starlight_sed * density_normalization)
+            self.dust_thermal_sed, self.scattered_starlight_sed = result
         else:
-            out = (SED_therm + SED_sca) * norm_factor
-            self.SED = out
-            return out
+            result = unnormalized_sed * density_normalization
+            self.total_sed = result
 
-    # ---- plotting ---------------------------------------------------
-    def plot_SED(self):
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.loglog(self.wavelengths_for_calc, self.SED_therm,
-                   label='Thermal', c='red', linewidth=2)
-        plt.loglog(self.wavelengths_for_calc, self.SED_therm + self.SED_sca,
-                   label='Total', c='black', linewidth=2, linestyle='--')
-        plt.xlabel('Wavelength [µm]', fontsize=14)
-        plt.ylabel('Flux [Jy]', fontsize=14)
-        plt.title('SED — Opus Optimized', fontsize=16)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tick_params(axis='both', labelsize=12)
-        plt.tight_layout()
-        plt.show()
-
-
-# ── standalone test ──────────────────────────────────────────────────────
-if __name__ == '__main__':
-    import matplotlib.pyplot as plt
-    from pyGrater.stargrains import Grain, Star
-    from pyGrater.density import two_power_law
-    from pyGrater.size_distributions import power_law_distribution
-
-    grain = Grain(redo_Q=False)
-    star  = Star(star_name='bPic')
-
-    test_params = {
-        'r0': 0.09, 'h0': 0.009, 'alphain': 10., 'alphaout': -6,
-        'gamma': 2., 'beta': 2, 'itilt': 45., 'PA': 30., 'omega': 60.,
-        'a_min': 0.01e-6, 'a_max': 1000e-6, 'kappa': 6,
-        'N_sizes_integral': 400, 'g': 0.5, 'M_tot': 2.5e-10,
-    }
-
-    wavelengths = np.geomspace(1, 100, 1000)
-    sed = SED(grain, star, two_power_law, power_law_distribution, wavelengths)
-
-    t0 = time.time()
-    SED_th, SED_sc = sed.get_SED(keep_separate_fluxes=True,
-                                  verbose_timing=True, **test_params)
-    print(f'Total wall-clock: {time.time() - t0:.2f} s')
-    sed.plot_SED()
+        if return_emission_by_distance:
+            (dust_thermal_emission_by_distance,
+             scattered_starlight_by_distance) = emission_by_distance
+            self.dust_thermal_emission_by_distance = (
+                dust_thermal_emission_by_distance)
+            self.scattered_starlight_by_distance = (
+                scattered_starlight_by_distance)
+            return (result, dust_thermal_emission_by_distance,
+                    scattered_starlight_by_distance)
+        return result

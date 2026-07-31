@@ -1,3 +1,4 @@
+import logging
 #%%
 import numpy as np
 import scipy.integrate
@@ -15,6 +16,9 @@ from pyGrater.config.paths import DataPathConfig
 from scipy.interpolate import RegularGridInterpolator
 from astropy import units as u
 # =============================================================================
+
+
+logger = logging.getLogger(__name__)
 def fit_power_law(x, y):
     """Fit a power law"""
     # Convert to log space
@@ -29,7 +33,7 @@ def coeff(x,arr) :
     """Give the 2 closest positions in array to x, and the corresponding coefficients"""
     
     if arr.size < 2 :
-        print("Array too small")
+        logger.info("Array too small")
         return np.array([0,0]), np.array([1.,0.])
     else : 
         work = np.sort(arr)
@@ -195,14 +199,14 @@ def get_Q(path_Q, grain_composition_name, talk= True):
         'Qabs': Qabs,
         'Qpr': Qpr
     }
-    if talk :
-        recap = (f"{grain_composition_name} optical tables already exist :"
-                f"\n--> Wavelengths : {waves.size} values "
-                f"from {np.min(waves):.1e} to {np.max(waves):.1e} microns"
-                f"\n--> Sizes : {sizes.size} values "
-                f"from {np.min(sizes):.1e} to {np.max(sizes):.1e} microns"
-            )
-        print(recap)
+    if talk:
+        logger.info("%s optical tables already exist:", grain_composition_name)
+        logger.info(
+            "  Wavelengths: %s values from %.1e to %.1e microns",
+            waves.size, np.min(waves), np.max(waves))
+        logger.info(
+            "  Sizes: %s values from %.1e to %.1e microns",
+            sizes.size, np.min(sizes), np.max(sizes))
         
     return output_dic
 
@@ -282,7 +286,7 @@ def calc_Q_IDL(
         ngcl = len(graincomplist)
 
         if talk:
-            print(f"-> reading {gclfile}")
+            logger.info(f"-> reading {gclfile}")
 
     else:
 
@@ -291,7 +295,7 @@ def calc_Q_IDL(
         os.makedirs(path_Q, exist_ok=True)
 
         if talk:
-            print(f"-> creating {gclfile}")
+            logger.info(f"-> creating {gclfile}")
 
     compute = True
     MIEfilename = None
@@ -325,10 +329,8 @@ def calc_Q_IDL(
             compute = False
 
             if talk:
-                print(
-                    "-> Mie coefficients already computed for this composition. "
-                    f"Loading file {MIEfilename}.npz"
-                )
+                logger.info("-> Mie coefficients already computed for this composition. "
+                    f"Loading file {MIEfilename}.npz")
 
             ii = ngcl
 
@@ -341,7 +343,7 @@ def calc_Q_IDL(
     if compute:
 
         if talk:
-            print("-> New composition, launch simulation")
+            logger.info("-> New composition, launch simulation")
 
         # --- optical constants of materials
         mgrain = optical_constants(lambda_grid, graincomp)
@@ -358,7 +360,7 @@ def calc_Q_IDL(
         )
 
         if talk:
-            print("-> Mie coeff computation is done")
+            logger.info("-> Mie coeff computation is done")
 
         # ========================================================
         # STORE RESULTS
@@ -403,10 +405,8 @@ def calc_Q_IDL(
         )
 
         if talk:
-            print(
-                "-> Computation over for this composition, "
-                f"graincomplist updated, new data file: {MIEfilename}.npz"
-            )
+            logger.info("-> Computation over for this composition, "
+                f"graincomplist updated, new data file: {MIEfilename}.npz")
 
     else:
 
@@ -438,7 +438,7 @@ def calc_Q(N_sizes, size_min, size_max, N_waves, N_waves_undersampled, waves_min
     
     
     if talk :
-        print(f"Calculating Q for {grain_composition_name} grains.")
+        logger.info(f"Calculating Q for {grain_composition_name} grains.")
 
     if not os.path.exists(path_Q):
         os.makedirs(path_Q)
@@ -454,7 +454,7 @@ def calc_Q(N_sizes, size_min, size_max, N_waves, N_waves_undersampled, waves_min
         np.any(indpara[:,0] != indper2[:,0]) or 
         np.any(indper2[:,0] != indper1[:,0])) :
     
-        print("Wrong wavelength coverage")
+        logger.info("Wrong wavelength coverage")
         # Take the smallest the wavelength coverage and put it in para z
         z = indpara[:,0] # para
         b = indper1[:,0] # per1
@@ -529,7 +529,7 @@ def calc_Q(N_sizes, size_min, size_max, N_waves, N_waves_undersampled, waves_min
                                     kind='linear') # Imaginary part           
     # Resample the grain wavelenghts
     ind_tot = np.zeros([N_waves,3])
-    print("LOOKATTHIS:", N_waves, lam1, lam2, type(lam1), type(lam2))
+    logger.info('%s %s %s %s %s %s', "LOOKATTHIS:", N_waves, lam1, lam2, type(lam1), type(lam2))
     ind_tot[:,0] = 10**( np.arange(N_waves)/float(N_waves-1) * 
                         (np.log10(lam2)-np.log10(lam1)) 
                         + np.log10(lam1) ) # wavelenghts 
@@ -540,19 +540,19 @@ def calc_Q(N_sizes, size_min, size_max, N_waves, N_waves_undersampled, waves_min
     # Grain sizes range definition (microns)   
     sizes = 10**( np.arange(N_sizes)/(N_sizes-1) * (np.log10(size_max)-np.log10(size_min)) 
                 + np.log10(size_min))
-    print('Size range:', sizes.min(), sizes.max())
-    print('Wavelenght range:', waves.min(), waves.max())
+    logger.info('%s %s %s', 'Size range:', sizes.min(), sizes.max())
+    logger.info('%s %s %s', 'Wavelenght range:', waves.min(), waves.max())
 
     # Creation of the output Q matrixes, to store the results
-    print('Calculating Q values for min/max sizes :', sizes[:,None].min(), sizes[:,None].max())
-    print('Calculating Q values for min/max waves :', ind_tot[:,0].min(), ind_tot[:,0].max())
+    logger.info('%s %s %s', 'Calculating Q values for min/max sizes :', sizes[:,None].min(), sizes[:,None].max())
+    logger.info('%s %s %s', 'Calculating Q values for min/max waves :', ind_tot[:,0].min(), ind_tot[:,0].max())
     xgrains = 2*np.pi*(sizes[:,None]/ind_tot[:,0]) # Matrix with Qsca_s (sizes) rows and n_wave_res (lambas) columns
-    print('This is the shape of xgrains:',xgrains.shape)
+    logger.info('%s %s', 'This is the shape of xgrains:', xgrains.shape)
     Qsca = np.zeros_like(xgrains)
     Qabs = np.zeros_like(xgrains)
     Qpr = np.zeros_like(xgrains)
     if talk: 
-        print("Not parallelized version of the Mie theory")
+        logger.info("Not parallelized version of the Mie theory")
     N_iterations = xgrains.shape[0]
     for (i,xgrain) in enumerate(tqdm(xgrains, desc='Calculating Q coefficients')): # For each lambda and s
         # print('Calculating Q coefficients:', i/N_iterations, '%')
@@ -690,7 +690,7 @@ def optimal_sampling(x,y,n):
     ny = y.shape[0]#/nx
     
     if n > nx :
-        print("Oversampled")
+        logger.info("Oversampled")
         return np.arange(nx), x
         # the requested number of points is greater than the actual size of x
     
@@ -707,7 +707,7 @@ def optimal_sampling(x,y,n):
                 distrib[i] = distrib[i-1] + quad(f_slope,x[i-1],item)[0]
                 # add each term to accelerate computation and avoid some numerical exception
                 if quad(f_slope,x[i-1],item)[0] < 0 :
-                    print("Erreur", i) # print the errors
+                    logger.info('%s %s', "Erreur", i) # print the errors
         distrib = distrib/distrib[-1]
         # renormalisation : distrib should be uniformely distributed between 0 and 1
     else : # array-like size, generalisation of the previous case
@@ -720,7 +720,7 @@ def optimal_sampling(x,y,n):
                 if i !=0 :
                     distrib[i] = distrib[i-1] + quad(f_slope,x[i-1],item)[0]
                     if quad(f_slope,x[i-1],item)[0] < 0 :
-                        print("Erreur", i)
+                        logger.info('%s %s', "Erreur", i)
             distrib = distrib/distrib[-1]
             distrib_tot = distrib_tot*distrib
             #distrib_tot = distrib_tot+distrib
@@ -778,6 +778,28 @@ def optimal_sampling(x,y,n):
 
 
 
+def _integrated_transmitted_flux(filter_wavelengths_micron,
+                                filter_transmission,
+                                spectrum_wavelengths_micron,
+                                spectrum_flux_jy):
+    """Return spectrum flux integrated through a filter transmission curve."""
+    transmission = scipy.interpolate.interp1d(
+        filter_wavelengths_micron, filter_transmission, kind='linear')
+
+    def transmitted_flux(wavelength_micron):
+        """Return the filter-transmitted spectrum at one wavelength."""
+        spectrum = scipy.interpolate.interp1d(
+            spectrum_wavelengths_micron, spectrum_flux_jy, kind='linear')
+        return float(spectrum(wavelength_micron)
+                     * transmission(wavelength_micron))
+
+    transmitted_flux = np.vectorize(transmitted_flux, otypes=[float])
+    integrated_transmitted_flux = simpson(
+        transmitted_flux(filter_wavelengths_micron))
+    integrated_transmission = simpson(filter_transmission)
+    return integrated_transmitted_flux / integrated_transmission
+
+
 def flux_in_band(band, l_in, Fnu) :
     """Estimate flux in a given band
     (called in get_spectra)
@@ -804,21 +826,10 @@ def flux_in_band(band, l_in, Fnu) :
     test = (np.min(l_in) < np.min(l_sp)) and (np.max(l_sp) < np.max(l_in))
     # to check if the spectral range is wider than the filter. I changed this PP. Now it checks whether the filter is wider than the spectral range...makes more sense, no?
     if test :        
-        tr = scipy.interpolate.interp1d(l_sp,t_sp, kind='linear')
-        
-        def flux_tr(x) :
-            """return the transmitted flux of the star by the filter
-            at the wavelength"""
-            f = scipy.interpolate.interp1d(l_in,Fnu, kind='linear')
-            return float(f(x)*tr(x))
-
-        flux_tr = np.vectorize(flux_tr,otypes=[float])
-        int1 = simpson(flux_tr(l_sp))
-        int2 = simpson(t_sp)
-        flux_int = int1/int2 # integrated flux trought the filter
+        flux_int = _integrated_transmitted_flux(l_sp, t_sp, l_in, Fnu)
         return flux_int, zpf
     else :
-        print("Bad lambda coverage")
+        logger.info("Bad lambda coverage")
         return 0., zpf
 
 def flux_in_spectral_elem(band, l_in, Fnu, central_wave, width, N_elems=20):
@@ -879,21 +890,10 @@ def flux_in_band_old(band, l_in, Fnu) :
 
     # to check if the spectral range is wider than the filter. I changed this PP. Now it checks whether the filter is wider than the spectral range...makes more sense, no?
     if test :        
-        tr = scipy.interpolate.interp1d(l_sp,t_sp, kind='linear')
-        
-        def flux_tr(x) :
-            """return the transmitted flux of the star by the filter
-            at the wavelength"""
-            f = scipy.interpolate.interp1d(l_in,Fnu, kind='linear')
-            return float(f(x)*tr(x))
-
-        flux_tr = np.vectorize(flux_tr,otypes=[float])
-        int1 = simpson(flux_tr(l_sp))
-        int2 = simpson(t_sp)
-        flux_int = int1/int2 # integrated flux trought the filter
+        flux_int = _integrated_transmitted_flux(l_sp, t_sp, l_in, Fnu)
         return flux_int, zpf
     else :
-        print("Bad lambda coverage")
+        logger.info("Bad lambda coverage")
         return 0., 0
     
     
@@ -931,7 +931,7 @@ def congrid(a, newdims, method='linear', centre=False, minusone=False):
     old = np.array( a.shape )
     ndims = len( a.shape )
     if len( newdims ) != ndims:
-        print("[congrid] dimensions error. " \
+        logger.info("[congrid] dimensions error. " \
               "This routine currently only support " \
               "rebinning to the same number of dimensions.")
         return None
@@ -994,9 +994,7 @@ def congrid(a, newdims, method='linear', centre=False, minusone=False):
         newa = scipy.ndimage.map_coordinates(a, newcoords)
         return newa
     else:
-        print("Congrid error: Unrecognized interpolation type.\n", \
-              "Currently only \'neighbour\', \'nearest\',\'linear\',", \
-              "and \'spline\' are supported.")
+        logger.info('%s %s %s', "Congrid error: Unrecognized interpolation type.\n", "Currently only \'neighbour\', \'nearest\',\'linear\',", "and \'spline\' are supported.")
         return None 
 
 import numpy as np
@@ -1044,39 +1042,6 @@ def congrid_new(a, newdims, method='linear', center=False, minusone=False):
     # Interpolation
     return interpn(old_coords, a, np.stack(coords, -1),
                    method=method, bounds_error=False, fill_value=None)
-      
-def coeff(x,arr) :
-    """Give the 2 closest positions in array to x, and the corresponding coefficients"""
-    
-    if arr.size < 2 :
-        print("Array too small")
-        return np.array([0,0]), np.array([1.,0.])
-    else : 
-        work = np.sort(arr)
-        if x < work[0] :
-            return np.array([arr.argmin(),0]), np.array([1.,0.])
-        elif x > work[-1] :
-            return np.array([0,arr.argmax()]), np.array([0.,1.])
-        else :
-            exact = work == x
-            if exact.any() :
-                x1 = work[exact]
-                pos1 = np.where(arr==x1)[0][0]
-                pos2 = 0
-                w1 = 1
-                w2 = 0
-            else :
-                n = np.where(work<=x)[0][-1]
-                m = np.where(work>x)[0][0]
-                x1 = work[n]
-                x2 = work[m]
-                w2 = (x-x1) / (x2-x1)
-                w1 = 1 - w2
-                pos1 = np.where(arr==x1)[0][0]
-                pos2 = np.where(arr==x2)[0][0]
-            return np.array([pos1,pos2]), np.array([w1,w2])
-
-
 def import_material_properties(file_path):
     grain_dict = {}
 
@@ -1124,13 +1089,13 @@ def calc_therm_dist(Qabs, Qabs_sizes, Qabs_waves, star_waves, star_flux,
     Distance is in AU"""
     
     if talk:
-        print("Initializing the thermal equilibrium distance")
-        print('Distance to star (pc):', distance_to_star)
-        print('Star radius (Rsun):', radius_star_Rsun)
-        print('Grain sublimation temperature (K):', Tsub_grain)
-        print('Number of temperature points:', Ntemp)
-        print('Grain Qabs wavelengths:', np.min(Qabs_waves), np.max(Qabs_waves))
-        print('Star wavelengths:', np.min(star_waves), np.max(star_waves))  
+        logger.info("Initializing the thermal equilibrium distance")
+        logger.info('%s %s', 'Distance to star (pc):', distance_to_star)
+        logger.info('%s %s', 'Star radius (Rsun):', radius_star_Rsun)
+        logger.info('%s %s', 'Grain sublimation temperature (K):', Tsub_grain)
+        logger.info('%s %s', 'Number of temperature points:', Ntemp)
+        logger.info('%s %s %s', 'Grain Qabs wavelengths:', np.min(Qabs_waves), np.max(Qabs_waves))
+        logger.info('%s %s %s', 'Star wavelengths:', np.min(star_waves), np.max(star_waves))  
     # Build temperature grid
     # temp = 3. * np.power(1.2, np.arange(int(m.log(Tsub_grain/3.)/m.log(1.2)) + 1))
     temp = np.geomspace(3, int(Tsub_grain), num=Ntemp)
@@ -1196,7 +1161,7 @@ def calc_therm_dist(Qabs, Qabs_sizes, Qabs_waves, star_waves, star_flux,
     therm_dist = dist + radius_star_Rsun * cst.R_sun / cst.au
 
     if save_path is not None :
-        print('Thermal distances saved to:', save_path)
+        logger.info('%s %s', 'Thermal distances saved to:', save_path)
         np.savez(save_path, therm_dist=therm_dist, temp_range=temp_range)
     return therm_dist, temp_range
 
@@ -1240,10 +1205,10 @@ def init_therm_dist_old_deprecated(Qabs, Qabs_sizes, Qabs_waves, star_waves, sta
     Distance is in AU"""
     
     if talk :
-        print("Initializing the thermal equilibrium distance")
+        logger.info("Initializing the thermal equilibrium distance")
     temp = 3.*np.power(1.2,np.arange(int(m.log(Tsub_grain/3.)/m.log(1.2))+1))
     temp = np.append(temp,[Tsub_grain]) # range of accessible temperatures
-    print('These are the temperatures:', temp)
+    logger.info('%s %s', 'These are the temperatures:', temp)
     dist = np.zeros([Qabs_sizes.size,temp.size])
 
     F_lam = star_flux/star_waves/star_waves * (cst.c * 1e2 * 1.e-15)  # Jy -> erg/s/cm^3
@@ -1257,7 +1222,7 @@ def init_therm_dist_old_deprecated(Qabs, Qabs_sizes, Qabs_waves, star_waves, sta
     #print lam1, lam2
     total_length = Qabs_sizes.shape[0]
     for (j,s) in enumerate(Qabs_sizes) : # For each grain size
-        print(f'Iterating over grain sizes:',100*j/total_length, '%', end='\r')
+        logger.info('%s %s %s', f'Iterating over grain sizes:', 100*j/total_length, '%')
         #print j
         #lam1 = Qabs_waves[np.where(Qabs[j]>1e-3)[0][0]]
         #lam2 = Qabs_waves[np.where(Qabs[j]>1e-3)[0][-1]]
@@ -1380,7 +1345,7 @@ def get_total_mass_from_normalization_density(
     # Size integral: integral of n(a) * m(a) da
     sizes_integrand = (4 * np.pi / 3) * grain_density * sizes**3 * size_distribution_function(sizes, size_dist_params_dic)
     mean_grain_mass = scipy.integrate.trapezoid(sizes_integrand, sizes)
-    print('sizes_integrand shape:', sizes_integrand.shape)
+    logger.info('%s %s', 'sizes_integrand shape:', sizes_integrand.shape)
     # Spatial integral with Jacobian: integral over zeta in [-1,1] then r
     r_2d = distances[:, np.newaxis] * np.ones_like(z_2d)   # (n_r, N_zeta)
     density = density_function(r_2d, 0., z_2d, density_params_dic)  # (n_r, N_zeta)
@@ -1410,7 +1375,7 @@ def calculate_normalization_density_jacobian(
     # Size integral: integral of n(a) * m(a) da
     sizes_integrand = (4 * np.pi / 3) * grain_density * sizes**3 * size_distribution_function(sizes, size_dist_params_dic)
     mean_grain_mass = scipy.integrate.trapezoid(sizes_integrand, sizes)
-    print('sizes_integrand shape:', sizes_integrand.shape)
+    logger.info('%s %s', 'sizes_integrand shape:', sizes_integrand.shape)
     # Spatial integral with Jacobian: integral over zeta in [-1,1] then r
     r_2d = distances[:, np.newaxis] * np.ones_like(z_2d)   # (n_r, N_zeta)
     density = density_function(r_2d, 0., z_2d, density_params_dic)  # (n_r, N_zeta)
@@ -1440,7 +1405,7 @@ def calculate_normalization_density_jacobian_test(
     # Size integral: integral of n(a) * m(a) da
     sizes_integrand = (4 * np.pi / 3) * grain_density * sizes**3 * size_distribution_function(sizes, size_dist_params_dic)
     mean_grain_mass = scipy.integrate.trapezoid(sizes_integrand, sizes)
-    print('sizes_integrand shape:', sizes_integrand.shape)
+    logger.info('%s %s', 'sizes_integrand shape:', sizes_integrand.shape)
     c_gamma = 2
     # Spatial integral with Jacobian: integral over zeta in [-1,1] then r
     r_2d = distances #[:, np.newaxis] * np.ones_like(z_2d)   # (n_r, N_zeta)
@@ -1472,7 +1437,7 @@ def calculate_total_mass(
     # Size integral: integral of n(a) * m(a) da
     sizes_integrand = (4 * np.pi / 3) * grain_density * sizes**3 * size_distribution_function(sizes, size_dist_params_dic)
     mean_grain_mass = scipy.integrate.trapezoid(sizes_integrand, sizes)
-    print('sizes_integrand shape:', sizes_integrand.shape)
+    logger.info('%s %s', 'sizes_integrand shape:', sizes_integrand.shape)
     # Spatial integral with Jacobian: integral over zeta in [-1,1] then r
     r_2d = distances[:, np.newaxis] * np.ones_like(z_2d)   # (n_r, N_zeta)
     density = density_function(r_2d, 0., z_2d, density_params_dic)  # (n_r, N_zeta)
@@ -1831,5 +1796,3 @@ def calculate_normalization_density_jacobian_sublimation_vfast(
     number_of_grains = scipy.integrate.trapezoid(zeta_integral, distances, axis=0)
 
     return total_mass / number_of_grains
-
-

@@ -25,37 +25,24 @@ Optional flags:
     --quick      tiny grids — fast sanity check
     --profile    write full cProfile output to benchmark_image.prof
 """
+import logging
 
 import argparse
 import cProfile
 import io
-import os
 import pstats
 import time
 
 import matplotlib
+
+from pyGrater.config.logging_config import log_info
+logger = logging.getLogger(__name__)
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ── optional memory tracking ─────────────────────────────────────────────────
-try:
-    import psutil
-    _HAS_PSUTIL = True
-    def _rss_mb():
-        return psutil.Process(os.getpid()).memory_info().rss / 1024**2
-except ImportError:
-    _HAS_PSUTIL = False
-    def _rss_mb():
-        return float("nan")
-
-
-def _divider(title=""):
-    w = 70
-    if title:
-        print(f"\n{'─' * 3} {title} {'─' * (w - 5 - len(title))}")
-    else:
-        print("─" * w)
+from pyGrater.tests.benchmark_helpers import divider as _divider
+from pyGrater.tests.benchmark_helpers import rss_mb as _rss_mb
 
 
 # ── shared parameters ─────────────────────────────────────────────────────────
@@ -286,9 +273,9 @@ def bench_single_call(wavelengths, params):
     img_obj = _make_image_obj(grain, star, wavelengths)
 
     nx, ny = params.get("nx", 128), params.get("ny", 128)
-    print(f"  Wavelengths : {len(wavelengths)}  ({wavelengths[0]:.1f}–{wavelengths[-1]:.1f} µm)")
-    print(f"  Grid        : {nx} × {ny} px")
-    print(f"  N_sizes_int : {params['N_sizes_integral']}")
+    log_info(logger, f"  Wavelengths : {len(wavelengths)}  ({wavelengths[0]:.1f}–{wavelengths[-1]:.1f} µm)")
+    log_info(logger, f"  Grid        : {nx} × {ny} px")
+    log_info(logger, f"  N_sizes_int : {params['N_sizes_integral']}")
 
     mem_before = _rss_mb()
     _, _, timings = _run_image_timed(img_obj, params)
@@ -301,15 +288,15 @@ def bench_single_call(wavelengths, params):
         v = timings[k]
         pct = v / total * 100
         bar = "█" * int(pct / 2)
-        print(f"  {k:20s}: {v:7.3f} s  {pct:5.1f}%  {bar}")
+        log_info(logger, f"  {k:20s}: {v:7.3f} s  {pct:5.1f}%  {bar}")
 
     loop_arr = np.array(timings["loop_per_wave"])
-    print(f"\n  Per-wavelength LOS loop (mean ± std): "
+    log_info(logger, f"\n  Per-wavelength LOS loop (mean ± std): "
           f"{loop_arr.mean():.3f} ± {loop_arr.std():.3f} s")
-    print(f"  Masked pixels : {timings['n_masked_px']} / {timings['n_pixels_total']}"
+    log_info(logger, f"  Masked pixels : {timings['n_masked_px']} / {timings['n_pixels_total']}"
           f"  ({100*timings['n_masked_px']/timings['n_pixels_total']:.1f}%)")
     if _HAS_PSUTIL:
-        print(f"  Memory increase : {mem_after - mem_before:.1f} MB")
+        log_info(logger, f"  Memory increase : {mem_after - mem_before:.1f} MB")
     return timings
 
 
@@ -320,8 +307,8 @@ def bench_scale_resolution(res_list, wavelengths, params_base, n_runs=5):
     img_obj = _make_image_obj(grain, star, wavelengths)
 
     results = []
-    print(f"  {'nx':>6}  {'mean (s)':>9}  {'+/-':>7}")
-    print(f"  {'─'*6}  {'─'*9}  {'─'*7}")
+    log_info(logger, f"  {'nx':>6}  {'mean (s)':>9}  {'+/-':>7}")
+    log_info(logger, f"  {'─'*6}  {'─'*9}  {'─'*7}")
     for n in res_list:
         p = {**params_base, "nx": n, "ny": n}
         walls = []
@@ -330,7 +317,7 @@ def bench_scale_resolution(res_list, wavelengths, params_base, n_runs=5):
             walls.append(tm["total"])
         mean, std = float(np.mean(walls)), float(np.std(walls))
         results.append((n, mean, std))
-        print(f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
+        log_info(logger, f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
     return results
 
 
@@ -340,8 +327,8 @@ def bench_scale_wavelengths(n_wav_list, params, n_runs=5):
     grain, star = _make_objects()
 
     results = []
-    print(f"  {'N_wav':>6}  {'mean (s)':>9}  {'+/-':>7}")
-    print(f"  {'─'*6}  {'─'*9}  {'─'*7}")
+    log_info(logger, f"  {'N_wav':>6}  {'mean (s)':>9}  {'+/-':>7}")
+    log_info(logger, f"  {'─'*6}  {'─'*9}  {'─'*7}")
     for n in n_wav_list:
         wl = np.geomspace(1.0, 200.0, n)
         img_obj = _make_image_obj(grain, star, wl)
@@ -351,7 +338,7 @@ def bench_scale_wavelengths(n_wav_list, params, n_runs=5):
             walls.append(tm["total"])
         mean, std = float(np.mean(walls)), float(np.std(walls))
         results.append((n, mean, std))
-        print(f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
+        log_info(logger, f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
     return results
 
 
@@ -366,8 +353,8 @@ def bench_scale_nl(nl_list, wavelengths, params):
     grain, star = _make_objects()
 
     results = []
-    print(f"  {'nl':>5}  {'loop (s)':>9}  {'total (s)':>10}")
-    print(f"  {'─'*5}  {'─'*9}  {'─'*10}")
+    log_info(logger, f"  {'nl':>5}  {'loop (s)':>9}  {'total (s)':>10}")
+    log_info(logger, f"  {'─'*5}  {'─'*9}  {'─'*10}")
 
     # We approximate by timing only the loop; full instrumented run is
     # accurate enough here without monkey-patching Image internals.
@@ -387,7 +374,7 @@ def bench_scale_nl(nl_list, wavelengths, params):
         wall = time.perf_counter() - t0
         _, _, tm = _run_image_timed(img_obj, p)
         results.append((nl, tm["los_loop"], tm["total"]))
-        print(f"  {nl:>5}  {tm['los_loop']:>9.3f}  {tm['total']:>10.3f}")
+        log_info(logger, f"  {nl:>5}  {tm['los_loop']:>9.3f}  {tm['total']:>10.3f}")
     return results
 
 
@@ -405,12 +392,12 @@ def bench_cprofile(wavelengths, params, out_file="benchmark_image.prof"):
     stream = io.StringIO()
     ps = pstats.Stats(pr, stream=stream).sort_stats("cumulative")
     ps.print_stats(30)
-    print(stream.getvalue())
+    log_info(logger, stream.getvalue())
 
     if out_file:
         pr.dump_stats(out_file)
-        print(f"  Full profile saved to: {out_file}")
-        print(f"  Inspect with:  python -m pstats {out_file}")
+        log_info(logger, f"  Full profile saved to: {out_file}")
+        log_info(logger, f"  Inspect with:  python -m pstats {out_file}")
 
 
 # ── scaling plot ──────────────────────────────────────────────────────────────
@@ -441,7 +428,7 @@ def plot_scaling(res_results, wav_results, out="benchmark_image_scaling.png"):
 
     plt.tight_layout()
     plt.savefig(out, dpi=120)
-    print(f"\n  Scaling plot saved to: {out}")
+    log_info(logger, f"\n  Scaling plot saved to: {out}")
     plt.close()
 
 
@@ -470,9 +457,9 @@ def main():
         nl_list     = [25, 49, 99, 201]
         params      = {**BASE_DISK_PARAMS}
 
-    print("=" * 70)
-    print("pyGrater — Image generation benchmark")
-    print("=" * 70)
+    log_info(logger, "=" * 70)
+    log_info(logger, "pyGrater — Image generation benchmark")
+    log_info(logger, "=" * 70)
 
     bench_single_call(wavelengths, params)
 
@@ -488,7 +475,7 @@ def main():
         plot_scaling(res_results, wav_results)
 
     _divider()
-    print("Done.")
+    log_info(logger, "Done.")
 
 
 if __name__ == "__main__":

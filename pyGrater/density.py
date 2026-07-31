@@ -1,18 +1,71 @@
-#%%
-# -*- coding: utf-8 -*-
+"""Dust spatial-density distributions."""
+import logging
 
 import numpy as np
 
 
-def two_power_law(rho, theta, z, parameter_dictionary):
-    rn = rho / parameter_dictionary['r0']
-    return 1./np.sqrt(rn**(-2.*parameter_dictionary['alphain']) + rn**(-2.*parameter_dictionary['alphaout'])) \
-    * np.exp(-(np.abs(z)/(parameter_dictionary['h0']*rn**parameter_dictionary['beta']))**parameter_dictionary['gamma'])
+
+
+logger = logging.getLogger(__name__)
+try:
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True)
+    def two_power_law_numba(cylindrical_radius_au, height_above_midplane_au,
+                            r0, h0, alphain, alphaout, beta, gamma):
+        """Fast compiled version of :func:`two_power_law` for image grids."""
+        n_line_of_sight, n_pixels = cylindrical_radius_au.shape
+        output = np.empty((n_line_of_sight, n_pixels))
+        for pixel_index in prange(n_pixels):
+            for line_index in range(n_line_of_sight):
+                normalized_radius = (
+                    cylindrical_radius_au[line_index, pixel_index] / r0)
+                if normalized_radius == 0.0:
+                    output[line_index, pixel_index] = 0.0
+                    continue
+                radial_density = 1.0 / np.sqrt(
+                    normalized_radius**(-2.0 * alphain)
+                    + normalized_radius**(-2.0 * alphaout))
+                scale_height_au = h0 * normalized_radius**beta
+                vertical_density = np.exp(-(
+                    abs(height_above_midplane_au[line_index, pixel_index])
+                    / scale_height_au
+                )**gamma)
+                output[line_index, pixel_index] = (
+                    radial_density * vertical_density)
+        return output
+
+    _NUMBA_DENSITY_AVAILABLE = True
+except ImportError:
+    two_power_law_numba = None
+    _NUMBA_DENSITY_AVAILABLE = False
+
+
+def two_power_law(cylindrical_radius_au, azimuth_radian,
+                  height_above_midplane_au, parameters):
+    """Return the relative density of an axisymmetric two-slope disk.
+
+    The density peaks near ``r0``.  ``alphain`` and ``alphaout`` control its
+    inner and outer radial slopes; ``h0``, ``beta``, and ``gamma`` describe
+    the vertical scale height and profile.  ``azimuth_radian`` is accepted for
+    the common density-function API but is unused for an axisymmetric disk.
+    """
+    del azimuth_radian
+    normalized_radius = cylindrical_radius_au / parameters['r0']
+    radial_density = 1.0 / np.sqrt(
+        normalized_radius**(-2.0 * parameters['alphain'])
+        + normalized_radius**(-2.0 * parameters['alphaout']))
+    scale_height_au = (
+        parameters['h0'] * normalized_radius**parameters['beta'])
+    vertical_density = np.exp(-(
+        np.abs(height_above_midplane_au) / scale_height_au
+    )**parameters['gamma'])
+    return radial_density * vertical_density
 
 
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     r0 = 1
     theta = np.linspace(0, 2*np.pi, 100)
     rho = np.linspace(0.1, 10, 120)  # Changed to positive values only
@@ -28,7 +81,7 @@ if __name__=='__main__':
     # Calculate density at z=0 as function of radius
     density = two_power_law(r, th, z_m, density_params_dic)
 
-    print('The shape is:', density.shape)
+    logger.info('%s %s', 'The shape is:', density.shape)
 
     
     #%%

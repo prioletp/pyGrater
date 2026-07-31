@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyGrater"
-version = "0.1.0"
+version = "0.2.0"
 description = "Debris disk modeling and radiative transfer"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -41,12 +41,13 @@ dependencies = [
     "astropy>=5.0",
     "tqdm>=4.60",
     "pyyaml>=5.0",
+    "numba>=0.57",
 ]
 
 [project.urls]
-Homepage      = "https://github.com/prioletp/pyGRaTer_alpha"
+Homepage      = "https://github.com/prioletp/pyGRaTer"
 Documentation = "https://osf.io/mqkyf/overview"
-"Bug Tracker" = "https://github.com/prioletp/pyGRaTer_alpha/issues"
+"Bug Tracker" = "https://github.com/prioletp/pyGRaTer/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -69,7 +70,7 @@ docs = [
 pygrater-setup = "pyGrater.config.setup_cli:main"
 
 # ── package discovery ────────────────────────────────────────────────────────
-# finds pyGrater, pyGrater.config, pyGrater.fitters, pyGrater.parameters
+# finds pyGrater, pyGrater.config, and pyGrater.parameters
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pyGrater*"]

@@ -1,427 +1,470 @@
-#%%
-from pyGrater import Star, Grain, Temperature
-from pyGrater import utils as utl
-import numpy as np
-from astropy import constants as cst
-import astropy.units as u
+"""Fast grain radiative transfer shared by the optimized SED and image models.
 
-import scipy
-from scipy.interpolate import RegularGridInterpolator
-from scipy.integrate import quad, simpson, trapezoid
-import matplotlib.pyplot as plt
+The calculations assume an optically thin dust disk.  This module handles the
+grain physics only: equilibrium temperatures, absorption, thermal emission,
+and scattering.  Spatial integration over an entire disk belongs to
+``SED``; line-of-sight integration belongs to ``Image``.
+
+Array-dimension notation used below:
+
+``W``
+    Number of requested wavelengths.
+``S``
+    Number of grain sizes used for numerical integration.
+``D``
+    Number of stellocentric distances.
+``A``
+    Number of scattering angles.
+
+Unless stated otherwise, wavelengths are in microns, grain sizes are in
+metres, stellocentric distances are in au, and returned flux densities are in
+Jy before any disk-density or line-of-sight weighting.
+"""
+
 import time
-from tqdm import tqdm
 
-# ── optional numba acceleration ──────────────────────────────────────────
+import astropy.constants as cst
+import numpy as np
+from scipy.interpolate import interp1d
+
+from pyGrater.constants import (
+    LIGHT_SPEED_CM_S,
+    MAX_SAFE_EXPONENT,
+    MICRON_TO_CM,
+    PLANCK_C1_CGS,
+    PLANCK_C2_CM_K,
+)
+from pyGrater.temperatures import Temperature
+
+
 try:
     from numba import njit, prange
 
+    # Thermal emission on a complete (wavelength, distance) grid.  The grain
+    # size integral and Planck evaluation are fused to avoid a W x S x D cube.
     @njit(parallel=True, cache=True)
-    def _planck_thermal_fused(wav_cm, log5_lam, c1Cbb, lam5,
-                              temperatures, temp_ok, coeff, inv_d2):
-        """Fully fused thermal flux: Planck + size-integral, no 3-D intermediates."""
-        N_wav = wav_cm.shape[0]
-        N_s, N_d = temperatures.shape
-        flux = np.empty((N_wav, N_d))
-        for w in prange(N_wav):
-            lc = wav_cm[w]
-            ll = log5_lam[w]
-            cc = c1Cbb[w]
-            l5 = lam5[w]
-            for d in range(N_d):
-                acc = 0.0
-                for s in range(N_s):
-                    if temp_ok[s, d]:
-                        x = 1.43983 / (lc * temperatures[s, d]) + ll
-                        if x > 709.0:
-                            continue  # bb ≈ 0, skip
-                        acc += cc / (np.exp(x) - l5) * coeff[s, w]
-                flux[w, d] = acc * inv_d2
-        return flux
+    def _calculate_thermal_emission_by_distance_numba(
+            wavelength_cm, five_log_wavelength_cm, planck_to_jy_prefactor,
+            wavelength_cm_fifth_power, grain_temperatures,
+            grains_survive, absorption_cross_section,
+            inverse_observer_distance_squared):
+        n_wavelengths = wavelength_cm.shape[0]
+        n_grain_sizes, n_distances = grain_temperatures.shape
+        dust_thermal_emission = np.empty((n_wavelengths, n_distances))
+        for wavelength_index in prange(n_wavelengths):
+            current_wavelength_cm = wavelength_cm[wavelength_index]
+            current_five_log_wavelength = (
+                five_log_wavelength_cm[wavelength_index])
+            current_planck_prefactor = (
+                planck_to_jy_prefactor[wavelength_index])
+            current_wavelength_fifth_power = (
+                wavelength_cm_fifth_power[wavelength_index])
+            for distance_index in range(n_distances):
+                emission_at_distance = 0.0
+                for grain_size_index in range(n_grain_sizes):
+                    if grains_survive[grain_size_index, distance_index]:
+                        exponent = (
+                            PLANCK_C2_CM_K
+                            / (current_wavelength_cm
+                               * grain_temperatures[
+                                   grain_size_index, distance_index])
+                            + current_five_log_wavelength)
+                        if exponent > MAX_SAFE_EXPONENT:
+                            continue
+                        emission_at_distance += (
+                            current_planck_prefactor
+                            / (np.exp(exponent)
+                               - current_wavelength_fifth_power)
+                            * absorption_cross_section[
+                                grain_size_index, wavelength_index])
+                dust_thermal_emission[wavelength_index, distance_index] = (
+                    emission_at_distance
+                    * inverse_observer_distance_squared)
+        return dust_thermal_emission
 
     _NUMBA_AVAILABLE = True
-
-    @njit(parallel=True, cache=True)
-    def _interp_zeta_integral(flux, idx, w_frac, w1_frac, ib,
-                              geo_zw, N_r, N_zeta):
-        """Fused interpolation + ζ-integration for all wavelengths at once."""
-        N_wav = flux.shape[0]
-        out = np.empty((N_wav, N_r))
-        for i_w in prange(N_wav):
-            for i_r in range(N_r):
-                acc = 0.0
-                base = i_r * N_zeta
-                for i_z in range(N_zeta):
-                    k = base + i_z
-                    if ib[k]:
-                        val = (flux[i_w, idx[k]] * w1_frac[k]
-                               + flux[i_w, idx[k] + 1] * w_frac[k])
-                        acc += val * geo_zw[k]
-                out[i_w, i_r] = acc
-        return out
 except ImportError:
     _NUMBA_AVAILABLE = False
 
-def _trapezoid_weights(x):
-    """Pre-compute composite-trapezoid quadrature weights for a 1-D grid."""
+
+def _trapezoid_integration_coefficients(x):
+    """Return coefficients for composite-trapezoid integration on ``x``.
+
+    For sampled values ``f``, ``np.dot(f, coefficients)`` is numerically
+    equivalent to ``np.trapezoid(f, x)`` but avoids recomputing the coefficients
+    during every MCMC likelihood evaluation.
+    """
     dx = np.diff(x)
     w = np.empty_like(x)
-    w[0]    = dx[0]  / 2.0
-    w[-1]   = dx[-1] / 2.0
+    w[0] = dx[0] / 2.0
+    w[-1] = dx[-1] / 2.0
     w[1:-1] = (dx[:-1] + dx[1:]) / 2.0
     return w
 
 
+def _interp_regular_grid_2d(x_grid, y_grid, values, xq, yq):
+    """Bilinearly interpolate ``values`` onto the Cartesian product xq x yq."""
+    x_lower_index = np.searchsorted(x_grid, xq) - 1
+    y_lower_index = np.searchsorted(y_grid, yq) - 1
+    x_lower_index = np.clip(x_lower_index, 0, len(x_grid) - 2)
+    y_lower_index = np.clip(y_lower_index, 0, len(y_grid) - 2)
+
+    x_lower = x_grid[x_lower_index]
+    x_upper = x_grid[x_lower_index + 1]
+    y_lower = y_grid[y_lower_index]
+    y_upper = y_grid[y_lower_index + 1]
+    x_fraction = ((xq - x_lower) / (x_upper - x_lower))[:, None]
+    y_fraction = ((yq - y_lower) / (y_upper - y_lower))[None, :]
+
+    x_index_2d = x_lower_index[:, None]
+    y_index_2d = y_lower_index[None, :]
+    return (
+        (1.0 - x_fraction) * (1.0 - y_fraction)
+        * values[x_index_2d, y_index_2d]
+        + x_fraction * (1.0 - y_fraction)
+        * values[x_index_2d + 1, y_index_2d]
+        + (1.0 - x_fraction) * y_fraction
+        * values[x_index_2d, y_index_2d + 1]
+        + x_fraction * y_fraction
+        * values[x_index_2d + 1, y_index_2d + 1])
+
+
+def _interp_rows_by_x(x_grid, values, xq):
+    """Interpolate the first axis of a 2-D array and preserve its columns."""
+    lower_index = np.searchsorted(x_grid, xq) - 1
+    lower_index = np.clip(lower_index, 0, len(x_grid) - 2)
+    lower_x = x_grid[lower_index]
+    upper_x = x_grid[lower_index + 1]
+    fraction_above = ((xq - lower_x) / (upper_x - lower_x))[:, None]
+    return ((1.0 - fraction_above) * values[lower_index]
+            + fraction_above * values[lower_index + 1])
+
+
+def _precompute_interpolation_on_second_axis(y_grid, yq):
+    """Precompute grid cells and fractions for repeated interpolation at yq."""
+    lower_index = np.searchsorted(y_grid, yq) - 1
+    lower_index = np.clip(lower_index, 0, len(y_grid) - 2)
+    lower_y = y_grid[lower_index]
+    upper_y = y_grid[lower_index + 1]
+    fraction_above = (yq - lower_y) / (upper_y - lower_y)
+    return lower_index, fraction_above
+
+
+def _interp_two_regular_grid_2d_with_y(x_grid, values_a, values_b,
+                                       xq, y_lower_index, y_fraction_above):
+    """Bilinearly interpolate two arrays that share a precomputed second axis."""
+    x_lower_index = np.searchsorted(x_grid, xq) - 1
+    x_lower_index = np.clip(x_lower_index, 0, len(x_grid) - 2)
+    x_lower = x_grid[x_lower_index]
+    x_upper = x_grid[x_lower_index + 1]
+    x_fraction_above = ((xq - x_lower) / (x_upper - x_lower))[:, None]
+    y_fraction_above = y_fraction_above[None, :]
+    x_index_2d = x_lower_index[:, None]
+    y_index_2d = y_lower_index[None, :]
+
+    lower_x_lower_y = (1.0 - x_fraction_above) * (1.0 - y_fraction_above)
+    upper_x_lower_y = x_fraction_above * (1.0 - y_fraction_above)
+    lower_x_upper_y = (1.0 - x_fraction_above) * y_fraction_above
+    upper_x_upper_y = x_fraction_above * y_fraction_above
+
+    interpolated_a = (
+        lower_x_lower_y * values_a[x_index_2d, y_index_2d]
+        + upper_x_lower_y * values_a[x_index_2d + 1, y_index_2d]
+        + lower_x_upper_y * values_a[x_index_2d, y_index_2d + 1]
+        + upper_x_upper_y * values_a[x_index_2d + 1, y_index_2d + 1])
+    interpolated_b = (
+        lower_x_lower_y * values_b[x_index_2d, y_index_2d]
+        + upper_x_lower_y * values_b[x_index_2d + 1, y_index_2d]
+        + lower_x_upper_y * values_b[x_index_2d, y_index_2d + 1]
+        + upper_x_upper_y * values_b[x_index_2d + 1, y_index_2d + 1])
+    return interpolated_a, interpolated_b
+
+
 class Fluxes:
-    def __init__(self, grain, star, wavelengths_for_calc, size_distribution_function, scattering_phase_function, N_temp=600, N_distances=400, dist_max_input=1000, N_scattering_angles=500):
-        
-        # Same initialization as original Fluxes class
-        self.Qabs = grain.Qabs
-        self.Qsca = grain.Qsca
-        self.Q_sizes = grain.Qabs_sizes
-        self.Q_waves = grain.Qabs_waves
-        
-        self.stargrain_obj = Temperature(grain, star, N_temp=N_temp)
-        self.stellar_spectrum_wavelengths = star.waves
-        self.stellar_spectrum_fluxes = star.flux
-        
-        self.Tsub = grain.Tsub
-        
-        self.distance_observer_star = star.distance*cst.pc.value #In meters
-        
-        # Setup logarithmic distances grid
-        dist_max = np.min([dist_max_input, np.max(self.stargrain_obj.therm_dist)])
-        self.distances_for_flux = np.geomspace(np.min(self.stargrain_obj.therm_dist), dist_max, N_distances)
-        
-        # Get the grain temperatures T(size, distance) on the grid of sizes and distances used for flux calculations 
-        self.temperatures = self.stargrain_obj.get_temperature(self.distances_for_flux)
-        # print('The shape of temperatures is:', self.temperatures.shape)
-        # print('The shape of distances_for_flux is:', self.distances_for_flux.shape)
-        # print('The shape of Q_sizes is:', self.Q_sizes.shape)
-        # print('The shape of Q_waves is:', self.Q_waves.shape)
-        # Setup interpolators
-        self.temperature_interpolator = RegularGridInterpolator((self.Q_sizes, self.distances_for_flux), self.temperatures)
-        self.Qabs_interpolator = RegularGridInterpolator((self.Q_sizes, self.Q_waves), self.Qabs)
-        self.Qsca_interpolator = RegularGridInterpolator((self.Q_sizes, self.Q_waves), self.Qsca)
-        self.stellar_spectrum_interpolator = scipy.interpolate.interp1d(self.stellar_spectrum_wavelengths, 
-                                                                self.stellar_spectrum_fluxes, 
-                                                                kind='linear', bounds_error=False, fill_value=0)
-        self.wavelengths_for_calc = wavelengths_for_calc
-        self.size_distribution_function = size_distribution_function
-        
-        self.scattering_phase_function = scattering_phase_function
-        self.N_scattering_angles = N_scattering_angles
-        self.scattering_angles = np.linspace(0, np.pi, N_scattering_angles)
-        
+    """Calculate grain emission before integrating over the disk geometry.
 
-
-        # Cache for temperature calculations
-        self._temp_cache = {}
-        
-        
-    def _get_temperatures(self, sizes, distances):
-        """Vectorized temperature calculation with caching"""
-        cache_key = (tuple(sizes), tuple(distances))
-        if cache_key in self._temp_cache:
-            return self._temp_cache[cache_key]
-            
-        sizes_grid, dist_grid = np.meshgrid(sizes, distances, indexing='ij')
-        temperatures = self.temperature_interpolator((sizes_grid/1e-6, dist_grid))
-        
-        self._temp_cache[cache_key] = temperatures
-        return temperatures
-        
-    def Planck(self, waves, T):
-        """Vectorized Planck function"""
-        lam_cm = waves*1e-4
-        c1 = 1.1927e-5  # erg/s*cm^2/sr
-        c2 = 1.43983    # cm * K
-        x = c2/lam_cm/T + 5.*np.log(lam_cm)
-        bb = c1 / (np.exp(x) - lam_cm**5)
-        clight = 29979245800  # cm/s
-        Cbb = waves * waves / clight * 1.e15
-        return bb * Cbb
-    # def Planck(self, waves, T):
-    #     h = 6.6261e-27  # erg*s
-    #     c = 2.99792458e10  # cm/s
-    #     k = 1.3807e-16  # erg/K
-    #     lam_cm = waves*1e-4
-    #     c1 = 2*h*c  # erg/s*cm^2/sr
-    #     c2 = h*c/k     # cm * K
-    #     x = c2/(lam_cm*T)
-    #     bb  = (c1/(lam_cm**3)) / (np.exp(x) - 1) #IN erg·s−1·sr−1·cm−2·Hz−1
-    #     bb_Jy = bb * 1e23  # convert to Jy/sr
-    #     return bb_Jy
-    # def Planck(self, waves, T):
-    #     """
-    #     Planck function B_nu in Jy/sr
-
-    #     Parameters
-    #     ----------
-    #     waves : array
-    #         Wavelengths in microns
-    #     T : float or array
-    #         Temperature in Kelvin
-
-    #     Returns
-    #     -------
-    #     B_nu : array
-    #         Spectral radiance in Jy/sr
-    #     """
-    #     import numpy as np
-
-    #     # --- constants (CGS) ---
-    #     h = 6.62607015e-27      # erg*s
-    #     c = 2.99792458e10       # cm/s
-    #     k = 1.380649e-16        # erg/K
-
-    #     # --- convert wavelength to cm ---
-    #     lam = waves * 1e-4  # microns → cm
-
-    #     # --- convert to frequency ---
-    #     nu = c / lam
-
-    #     # --- Planck function B_nu (CGS) ---
-    #     expo = np.exp(h * nu / (k * T)) - 1.0
-    #     B_nu = (2 * h * nu**3) / (c**2 * expo)
-
-    #     # --- convert to Jy/sr ---
-    #     B_nu_Jy = B_nu / 1e-23
-
-    #     return B_nu_Jy
-    def thermal_flux(self, **kwargs):
-        """Vectorized thermal flux calculation"""
-        # Setup size distribution
-        a_min, a_max = kwargs['a_min'], kwargs['a_max']
-        N_sizes = kwargs['N_sizes_integral']
-        sizes = np.geomspace(a_min, a_max, N_sizes)
-        self.sizes_for_integral = sizes  # Store for later use
-        size_dist = self.size_distribution_function(sizes, kwargs)
-        
-        # Initialize output array
-        flux = np.zeros((len(self.wavelengths_for_calc), len(self.distances_for_flux)))
-        
-        # Calculate temperatures once
-        temperatures = self._get_temperatures(sizes, self.distances_for_flux)
-        
-        # Calculate for each wavelength
-        for i, wave in enumerate(tqdm(self.wavelengths_for_calc, desc="Thermal flux", disable=True)):
-            
-            #Interpolating Q_abs 
-            sizes_grid, waves_grid = np.meshgrid(sizes/1e-6, [wave], indexing='ij')
-            Q_abs =  self.Qabs_interpolator((sizes_grid.flatten(), waves_grid.flatten())).reshape(sizes_grid.shape)
-            
-            # Calculate blackbody emission
-            bb_flux = self.Planck(wave, temperatures)
-            bb_flux[temperatures > self.Tsub] = 0
-            
-            # Quantity to integrate
-            integrand = (bb_flux * 
-                        (np.pi * sizes[:, np.newaxis]**2) * 
-                        Q_abs * 
-                        size_dist[:, np.newaxis])
-            
-            # Integrate over sizes
-            flux[i] = trapezoid(integrand, sizes, axis=0) / self.distance_observer_star**2
-            
-        return flux
-
-    def scattered_flux(self, **kwargs):
-        # Setup size distribution
-        a_min, a_max = kwargs['a_min'], kwargs['a_max']
-        N_sizes = kwargs['N_sizes_integral']
-        sizes = np.geomspace(a_min, a_max, N_sizes)
-        self.sizes_for_integral = sizes  # Store for later use
-        size_dist = self.size_distribution_function(sizes, kwargs)
-        
-        # Initialize output array
-        flux = np.zeros((len(self.wavelengths_for_calc), len(self.distances_for_flux)))
-        
-        # Calculate temperatures once
-        temperatures = self._get_temperatures(sizes, self.distances_for_flux)
-        temperature_mask = temperatures <= self.Tsub
-        
-        # Calculate for each wavelength
-        for i, wave in enumerate(tqdm(self.wavelengths_for_calc, desc="Scattered flux", disable=True)):
-            
-            #Interpolating Q_sca
-            sizes_grid, waves_grid = np.meshgrid(sizes/1e-6, [wave], indexing='ij')
-            Q_sca = self.Qsca_interpolator((sizes_grid.flatten(), waves_grid.flatten())).reshape(sizes_grid.shape)
-            
-            
-            factor = (self.stellar_spectrum_interpolator(wave) /
-                            ((self.distances_for_flux*cst.au.value)**2))
-            
-            # Quantity to integrate
-            integrand = ((np.pi * sizes[:, np.newaxis]**2) * 
-                        Q_sca * 
-                        size_dist[:, np.newaxis] * 
-                        temperature_mask)
-            
-            # Integrate over sizes
-            flux[i] = trapezoid(integrand, sizes, axis=0) * factor
-        
-        # print(flux.shape)
-        # print(flux[:,:,].shape)
-        phase_function = self.scattering_phase_function(self.scattering_angles, **kwargs)[np.newaxis, np.newaxis, :]   # → shape (Ntheta, 1, 1)
-        flux = phase_function * flux[:, :, np.newaxis] 
-        # print(flux.shape)
-        return flux
-    
-    def get_fluxes(self, size_distribution_args):
-        thermal = self.thermal_flux(**size_distribution_args)
-        scattered = self.scattered_flux(**size_distribution_args)
-        return thermal, scattered
-
-class FastFluxes(Fluxes):
-    """Drop-in Fluxes replacement with vectorised wavelength handling.
-
-    Instead of looping over wavelengths one at a time (N_wav Python
-    iterations with per-iteration interpolation overhead), this class:
-
-    * pre-computes Q_abs / Q_sca for ALL (sizes, wavelengths) in a single
-      RegularGridInterpolator call,
-    * batches the Planck function over wavelength chunks (thermal), and
-    * uses a BLAS matrix-multiply for the full scattered-flux integral.
+    Initialization loads the temperature table and precomputes every quantity
+    that depends only on the star, material, wavelength grid, or distance grid.
+    A model evaluation therefore only updates grain-size-dependent quantities.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.flux_timings = {}
+    def __init__(self, grain, star, wavelengths_for_calc,
+                 size_distribution_function, scattering_phase_function,
+                 N_temp=600, N_distances=400, dist_max_input=1000,
+                 N_scattering_angles=500):
+        self.absorption_efficiency_grid = grain.Qabs
+        self.scattering_efficiency_grid = grain.Qsca
+        self.optical_property_grain_sizes_micron = grain.Qabs_sizes
+        self.optical_property_wavelengths_micron = grain.Qabs_waves
 
-    def Planck(self, waves, T):
-        """Overflow-safe Planck function (clamps exponent to 709)."""
-        lam_cm = waves * 1e-4
-        c1 = 1.1927e-5
-        c2 = 1.43983
-        x = c2 / lam_cm / T + 5.0 * np.log(lam_cm)
-        x_safe = np.minimum(x, 709.0)
-        bb = c1 / (np.exp(x_safe) - lam_cm**5)
-        clight = 29979245800
-        Cbb = waves * waves / clight * 1e15
-        return bb * Cbb
+        self.temperature_model = Temperature(grain, star, N_temp=N_temp)
+        self.stellar_spectrum_wavelengths_micron = star.waves
+        self.stellar_spectrum_flux_jy = star.flux
+        self.sublimation_temperature_k = grain.Tsub
+        self.observer_distance_m = star.distance * cst.pc.value
 
-    # ---- thermal flux ------------------------------------------------
-    def thermal_flux(self, size_distribution_args):
+        dist_max = np.min([
+            dist_max_input, np.max(self.temperature_model.therm_dist)])
+        self.stellocentric_distances_au = np.geomspace(
+            np.min(self.temperature_model.therm_dist), dist_max, N_distances)
+        self.grain_temperatures_by_size_and_distance = (
+            self.temperature_model.get_temperature(
+                self.stellocentric_distances_au))
+
+        self.stellar_spectrum_interpolator = interp1d(
+            self.stellar_spectrum_wavelengths_micron,
+            self.stellar_spectrum_flux_jy,
+            kind='linear', bounds_error=False, fill_value=0)
+        self.model_wavelengths_micron = np.asarray(
+            wavelengths_for_calc, dtype=np.float64)
+        self.size_distribution_function = size_distribution_function
+        self.scattering_phase_function = scattering_phase_function
+        self.n_scattering_angles = N_scattering_angles
+        self.scattering_angles_radian = np.linspace(
+            0, np.pi, N_scattering_angles)
+        self.sizes_for_integral = None
+        self.timings = {}
+        self._wavelength_cm = np.ascontiguousarray(
+            self.model_wavelengths_micron * MICRON_TO_CM)
+        self._five_log_wavelength_cm = np.ascontiguousarray(
+            5.0 * np.log(self._wavelength_cm))
+        self._wavelength_cm_fifth_power = np.ascontiguousarray(
+            self._wavelength_cm**5)
+        self._planck_to_jy_prefactor = np.ascontiguousarray(
+            PLANCK_C1_CGS * self.model_wavelengths_micron**2
+            / LIGHT_SPEED_CM_S * 1e15)
+        self._stellar_flux_at_model_wavelengths = np.asarray(
+            self.stellar_spectrum_interpolator(
+                self.model_wavelengths_micron))
+        self._zero_scattering_angle_radian = np.array([0.0])
+        self._stellocentric_distance_squared_m2 = (
+            self.stellocentric_distances_au * cst.au.value)**2
+        self._inverse_observer_distance_squared_m2 = (
+            1.0 / self.observer_distance_m**2)
+        (self._optical_wavelength_grid_index,
+         self._optical_wavelength_interpolation_fraction) = (
+            _precompute_interpolation_on_second_axis(
+                self.optical_property_wavelengths_micron,
+                self.model_wavelengths_micron))
+
+    def interpolate_grain_temperatures(
+            self, grain_sizes_m, stellocentric_distances_au):
+        """Return grain temperatures with shape ``(S, D)`` in kelvin."""
+        return _interp_regular_grid_2d(
+            self.optical_property_grain_sizes_micron,
+            self.stellocentric_distances_au,
+            self.grain_temperatures_by_size_and_distance,
+            grain_sizes_m / 1e-6,
+            stellocentric_distances_au)
+
+    def interpolate_absorption_efficiency(self, grain_sizes_m):
+        """Return Q_abs with shape ``(S, W)``."""
+        return _interp_regular_grid_2d(
+            self.optical_property_grain_sizes_micron,
+            self.optical_property_wavelengths_micron,
+            self.absorption_efficiency_grid,
+            grain_sizes_m / 1e-6,
+            self.model_wavelengths_micron)
+
+    def interpolate_scattering_efficiency(self, grain_sizes_m):
+        """Return Q_sca with shape ``(S, W)``."""
+        return _interp_regular_grid_2d(
+            self.optical_property_grain_sizes_micron,
+            self.optical_property_wavelengths_micron,
+            self.scattering_efficiency_grid,
+            grain_sizes_m / 1e-6,
+            self.model_wavelengths_micron)
+
+    def planck_function_jy(self, wavelengths_micron, temperatures_k):
+        """Evaluate the frequency-form Planck function and return Jy."""
+        wavelength_cm = wavelengths_micron * MICRON_TO_CM
+        exponent = (PLANCK_C2_CM_K / wavelength_cm / temperatures_k
+                    + 5.0 * np.log(wavelength_cm))
+        safe_exponent = np.minimum(exponent, MAX_SAFE_EXPONENT)
+        planck_cgs = PLANCK_C1_CGS / (
+            np.exp(safe_exponent) - wavelength_cm**5)
+        conversion_to_jy = (
+            wavelengths_micron**2 / LIGHT_SPEED_CM_S * 1e15)
+        return planck_cgs * conversion_to_jy
+
+    def _prepare_grain_size_integration(self, model_parameters):
+        """Build the grain-size grid and reusable geometric cross section."""
+        grain_sizes_m = np.geomspace(
+            model_parameters['a_min'],
+            model_parameters['a_max'],
+            model_parameters['N_sizes_integral'])
+        self.sizes_for_integral = grain_sizes_m
+        size_distribution = self.size_distribution_function(
+            grain_sizes_m, model_parameters)
+        geometric_cross_section_distribution = (
+            np.pi * grain_sizes_m**2 * size_distribution)
+        grain_size_integration_coefficients = (
+            _trapezoid_integration_coefficients(grain_sizes_m))
+        return (grain_sizes_m, geometric_cross_section_distribution,
+                grain_size_integration_coefficients)
+
+    def calculate_dust_thermal_emission(self, model_parameters):
+        """Return thermal emission with shape ``(W, D)``.
+
+        The returned array is the size-integrated grain emission evaluated at
+        each stellocentric distance.  Grains hotter than the material's
+        sublimation temperature contribute zero emission.
+        """
         t_start = time.perf_counter()
+        (grain_sizes_m, geometric_cross_section_distribution,
+         grain_size_integration_coefficients) = (
+            self._prepare_grain_size_integration(model_parameters))
 
-        a_min  = size_distribution_args['a_min']
-        a_max  = size_distribution_args['a_max']
-        N_sizes = size_distribution_args['N_sizes_integral']
-        sizes  = np.geomspace(a_min, a_max, N_sizes)
-        self.sizes_for_integral = sizes
-        size_dist = self.size_distribution_function(sizes, size_distribution_args)
-
-        temperatures = self._get_temperatures(sizes, self.distances_for_flux)
+        grain_temperatures = self.interpolate_grain_temperatures(
+            grain_sizes_m, self.stellocentric_distances_au)
         t_temps = time.perf_counter()
-
-        # Pre-compute Qabs for ALL (sizes, wavelengths) in ONE call
-        s_um = sizes / 1e-6
-        sg, wg = np.meshgrid(s_um, self.wavelengths_for_calc, indexing='ij')
-        Q_abs_all = self.Qabs_interpolator(
-            (sg.ravel(), wg.ravel())
-        ).reshape(len(sizes), len(self.wavelengths_for_calc))
+        absorption_efficiency = self.interpolate_absorption_efficiency(
+            grain_sizes_m)
         t_qinterp = time.perf_counter()
 
-        sizes_factor = np.pi * sizes**2 * size_dist   # (N_s,)
-        trap_w  = _trapezoid_weights(sizes)             # (N_s,)
-        temp_ok = temperatures <= self.Tsub              # (N_s, N_d) bool
-        inv_d2  = 1.0 / self.distance_observer_star**2
-
-        # coeff[s, w] = Q_abs(s,w) * π a² n(a) * trapez_weight(s)
-        coeff = Q_abs_all * (sizes_factor * trap_w)[:, None]   # (N_s, N_wav)
+        grains_survive = (
+            grain_temperatures <= self.sublimation_temperature_k)
+        absorption_cross_section = absorption_efficiency * (
+            geometric_cross_section_distribution
+            * grain_size_integration_coefficients)[:, None]
 
         if _NUMBA_AVAILABLE:
-            # Fully fused: Planck + size-contraction, no 3-D intermediates
-            wav_cm   = np.ascontiguousarray(self.wavelengths_for_calc * 1e-4)
-            log5_lam = 5.0 * np.log(wav_cm)
-            lam5     = wav_cm ** 5
-            clight   = 29979245800.0
-            c1Cbb    = 1.1927e-5 * self.wavelengths_for_calc**2 / clight * 1e15
-            flux = _planck_thermal_fused(
-                wav_cm, log5_lam, c1Cbb, lam5,
-                np.ascontiguousarray(temperatures),
-                np.ascontiguousarray(temp_ok),
-                np.ascontiguousarray(coeff), inv_d2)
+            dust_thermal_emission = (
+                _calculate_thermal_emission_by_distance_numba(
+                    self._wavelength_cm,
+                    self._five_log_wavelength_cm,
+                    self._planck_to_jy_prefactor,
+                    self._wavelength_cm_fifth_power,
+                    np.ascontiguousarray(grain_temperatures),
+                    np.ascontiguousarray(grains_survive),
+                    np.ascontiguousarray(absorption_cross_section),
+                    self._inverse_observer_distance_squared_m2))
         else:
-            # Fallback: chunked numpy (no numba)
-            N_wav  = len(self.wavelengths_for_calc)
-            N_dist = len(self.distances_for_flux)
-            flux   = np.zeros((N_wav, N_dist))
-            CHUNK = 50
-            for i0 in range(0, N_wav, CHUNK):
-                i1 = min(i0 + CHUNK, N_wav)
-                wc = self.wavelengths_for_calc[i0:i1]
-                bb = self.Planck(wc[:, None, None],
-                                 temperatures[None, :, :])
-                bb *= temp_ok[None, :, :]
-                flux[i0:i1] = np.einsum('wsd,sw->wd', bb,
-                                         coeff[:, i0:i1]) * inv_d2
-                del bb
+            n_wav = len(self.model_wavelengths_micron)
+            n_dist = len(self.stellocentric_distances_au)
+            dust_thermal_emission = np.zeros((n_wav, n_dist))
+            chunk = 50
+            for i0 in range(0, n_wav, chunk):
+                i1 = min(i0 + chunk, n_wav)
+                wavelength_chunk = self.model_wavelengths_micron[i0:i1]
+                planck_emission = self.planck_function_jy(
+                    wavelength_chunk[:, None, None],
+                    grain_temperatures[None, :, :])
+                planck_emission *= grains_survive[None, :, :]
+                dust_thermal_emission[i0:i1] = np.einsum(
+                    'wsd,sw->wd', planck_emission,
+                    absorption_cross_section[:, i0:i1])
+                dust_thermal_emission[i0:i1] *= (
+                    self._inverse_observer_distance_squared_m2)
 
         t_end = time.perf_counter()
-        self.flux_timings['thermal_temperatures'] = t_temps   - t_start
-        self.flux_timings['thermal_Q_interp']     = t_qinterp - t_temps
-        self.flux_timings['thermal_planck_loop']  = t_end     - t_qinterp
-        self.flux_timings['thermal_total']        = t_end     - t_start
-        return flux
+        self.timings['dust_temperature_interpolation'] = t_temps - t_start
+        self.timings['absorption_efficiency_interpolation'] = (
+            t_qinterp - t_temps)
+        self.timings['planck_emission_and_grain_size_integration'] = (
+            t_end - t_qinterp)
+        self.timings['dust_thermal_emission_total'] = t_end - t_start
+        return dust_thermal_emission
 
-    # ---- scattered flux ----------------------------------------------
-    def scattered_flux(self, size_distribution_args={}, phase_function_args={}):
+    def thermal_flux(self, params):
+        """Return thermal flux with shape ``(wavelength, distance)``.
+
+        This is a public diagnostic convenience method. ``SED`` and
+        ``Image`` do not call it; they use specialized combined calculation
+        paths to avoid unnecessary arrays and repeated work.
+        """
+        return self.calculate_dust_thermal_emission(params)
+
+    def calculate_scattered_starlight_for_all_angles(
+            self, model_parameters, scattering_parameters=None):
+        """Return the two factors needed for scattered-light images.
+
+        Returns
+        -------
+        scattered_starlight_before_angular_dependence : ndarray, shape (W, D)
+            Scattered stellar light including stellar illumination, Q_sca,
+            grain-size integration, and sublimation, but not the phase function.
+        scattering_phase_function_by_angle : ndarray, shape (A,)
+            Phase-function value at each tabulated scattering angle.
+
+        Multiplying these arrays as ``first[:, :, None] * second[None, None, :]``
+        gives scattered light as a function of wavelength, distance, and angle
+        without storing that much larger cube during normal image calculations.
+        """
+        if scattering_parameters is None:
+            scattering_parameters = model_parameters
         t_start = time.perf_counter()
+        (grain_sizes_m, geometric_cross_section_distribution,
+         grain_size_integration_coefficients) = (
+            self._prepare_grain_size_integration(model_parameters))
+        grain_temperatures = self.interpolate_grain_temperatures(
+            grain_sizes_m, self.stellocentric_distances_au)
+        grains_survive = (
+            grain_temperatures <= self.sublimation_temperature_k)
+        scattering_efficiency = self.interpolate_scattering_efficiency(
+            grain_sizes_m)
+        t_q = time.perf_counter()
 
-        a_min  = size_distribution_args['a_min']
-        a_max  = size_distribution_args['a_max']
-        N_sizes = size_distribution_args['N_sizes_integral']
-        sizes  = np.geomspace(a_min, a_max, N_sizes)
-        self.sizes_for_integral = sizes
-        size_dist = self.size_distribution_function(sizes, size_distribution_args)
-
-        temperatures = self._get_temperatures(sizes, self.distances_for_flux)
-        temp_mask = temperatures <= self.Tsub                    # (N_s, N_d)
-
-        # Pre-compute Qsca for ALL (sizes, wavelengths)
-        s_um = sizes / 1e-6
-        sg, wg = np.meshgrid(s_um, self.wavelengths_for_calc, indexing='ij')
-        Q_sca_all = self.Qsca_interpolator(
-            (sg.ravel(), wg.ravel())
-        ).reshape(len(sizes), len(self.wavelengths_for_calc))
-        t_qinterp = time.perf_counter()
-
-        # Stellar spectrum — evaluated once for ALL wavelengths
-        stellar = self.stellar_spectrum_interpolator(
-            self.wavelengths_for_calc)                           # (N_wav,)
-        factor = stellar[:, None] / \
-                 (self.distances_for_flux[None, :] * cst.au.value)**2
-
-        # Wavelength-independent common factor → enables pure matmul
-        sizes_factor = np.pi * sizes**2 * size_dist              # (N_s,)
-        common = sizes_factor[:, None] * temp_mask                # (N_s, N_d)
-
-        trap_w = _trapezoid_weights(sizes)                        # (N_s,)
-        weighted_Q = (Q_sca_all * trap_w[:, None]).T              # (N_wav, N_s)
-
-        # Single BLAS dgemm:  (N_wav, N_s) @ (N_s, N_d) → (N_wav, N_d)
-        flux = weighted_Q @ common
-        flux *= factor
-
-        phase_val = self.scattering_phase_function(
-            np.array([0.0]), **phase_function_args)[0]
-        flux *= phase_val
-
+        surviving_geometric_cross_section = (
+            geometric_cross_section_distribution[:, None] * grains_survive)
+        scattered_starlight_before_angular_dependence = (
+            (scattering_efficiency
+             * grain_size_integration_coefficients[:, None]).T
+            @ surviving_geometric_cross_section)
+        scattered_starlight_before_angular_dependence *= (
+            self._stellar_flux_at_model_wavelengths[:, None]
+            / self._stellocentric_distance_squared_m2[None, :])
+        scattering_phase_function_by_angle = self.scattering_phase_function(
+            self.scattering_angles_radian, **scattering_parameters)
         t_end = time.perf_counter()
-        self.flux_timings['scattered_Q_interp'] = t_qinterp - t_start
-        self.flux_timings['scattered_matmul']   = t_end     - t_qinterp
-        self.flux_timings['scattered_total']    = t_end     - t_start
+        self.timings['scattering_efficiency_interpolation'] = (
+            t_q - t_start)
+        self.timings['scattered_starlight_grain_size_integration'] = (
+            t_end - t_q)
+        self.timings['scattered_starlight_total'] = t_end - t_start
+        return (scattered_starlight_before_angular_dependence,
+                scattering_phase_function_by_angle)
 
-        # Return (N_wav, N_dist, 1) for interface compatibility
-        return flux[:, :, np.newaxis]
+    def scattered_flux(self, params):
+        """Return scattered flux with shape ``(wavelength, distance, angle)``.
 
-    # ---- combined ----------------------------------------------------
-    def get_fluxes(self, size_distribution_args):
-        thermal   = self.thermal_flux(size_distribution_args)
-        scattered = self.scattered_flux(size_distribution_args,
-                                        size_distribution_args)
-        return thermal, scattered
+        This diagnostic method materializes the complete three-dimensional
+        array. ``SED`` and ``Image`` intentionally do not call it;
+        their optimized paths keep distance and angular factors separate.
+        """
+        (distance_dependent_scattered_starlight,
+         scattering_phase_function_by_angle) = (
+            self.calculate_scattered_starlight_for_all_angles(params, params))
+        return (
+            distance_dependent_scattered_starlight[:, :, None]
+            * scattering_phase_function_by_angle[None, None, :])
 
+    def calculate_emission_for_image(self, model_parameters):
+        """Return thermal and scattered-light terms required by ``Image``."""
+        dust_thermal_emission_by_distance = (
+            self.calculate_dust_thermal_emission(model_parameters))
+        (scattered_starlight_before_angular_dependence,
+         scattering_phase_function_by_angle) = (
+            self.calculate_scattered_starlight_for_all_angles(
+                model_parameters, model_parameters)
+        )
+        return (dust_thermal_emission_by_distance,
+                scattered_starlight_before_angular_dependence,
+                scattering_phase_function_by_angle)
 
+    def calculate_emission_by_stellocentric_distance(
+            self, model_parameters):
+        """Return ``(thermal, scattered)`` arrays, each with shape ``(W, D)``.
+
+        Scattered starlight is evaluated at zero scattering angle, matching
+        the isotropic convention used by the disk-integrated SED.
+        """
+        (dust_thermal_emission_by_distance,
+         scattered_starlight_before_angular_dependence,
+         scattering_phase_function_by_angle) = (
+            self.calculate_emission_for_image(model_parameters))
+        scattered_starlight_by_distance = (
+            scattered_starlight_before_angular_dependence
+            * scattering_phase_function_by_angle[0])
+        return (dust_thermal_emission_by_distance,
+                scattered_starlight_by_distance)

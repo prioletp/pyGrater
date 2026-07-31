@@ -22,37 +22,24 @@ Optional flags:
     --profile    write full cProfile output to benchmark_sed.prof
                  (open with: python -m pstats benchmark_sed.prof)
 """
+import logging
 
 import argparse
 import cProfile
 import io
-import os
 import pstats
 import time
 
 import matplotlib
+
+from pyGrater.config.logging_config import log_info
+logger = logging.getLogger(__name__)
 matplotlib.use("Agg")          # no display needed
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ── optional memory tracking ─────────────────────────────────────────────────
-try:
-    import psutil
-    _HAS_PSUTIL = True
-    def _rss_mb():
-        return psutil.Process(os.getpid()).memory_info().rss / 1024**2
-except ImportError:
-    _HAS_PSUTIL = False
-    def _rss_mb():
-        return float("nan")
-
-
-def _divider(title=""):
-    w = 70
-    if title:
-        print(f"\n{'─' * 3} {title} {'─' * (w - 5 - len(title))}")
-    else:
-        print("─" * w)
+from pyGrater.tests.benchmark_helpers import divider as _divider
+from pyGrater.tests.benchmark_helpers import rss_mb as _rss_mb
 
 
 # ── shared disk / grain parameters ───────────────────────────────────────────
@@ -81,7 +68,7 @@ def _make_objects(composition=COMPOSITION, star_name=STAR_NAME, N_distances=400)
 def _make_sed(grain, star, wavelengths, N_distances=400):
     from pyGrater.density import two_power_law
     from pyGrater.size_distributions import power_law_distribution
-    from pyGrater.SED import SED
+    from pyGrater.SED_old import SED
     return SED(grain, star, two_power_law, power_law_distribution,
                wavelengths, N_distances=N_distances)
 
@@ -100,9 +87,9 @@ def bench_single_call(wavelengths, params, N_distances=400):
     grain, star, _ = _make_objects(N_distances=N_distances)
     sed_obj = _make_sed(grain, star, wavelengths, N_distances)
 
-    print(f"  Wavelengths : {len(wavelengths)}  ({wavelengths[0]:.1f}–{wavelengths[-1]:.1f} µm)")
-    print(f"  N_distances : {N_distances}")
-    print(f"  N_sizes_int : {params['N_sizes_integral']}")
+    log_info(logger, f"  Wavelengths : {len(wavelengths)}  ({wavelengths[0]:.1f}–{wavelengths[-1]:.1f} µm)")
+    log_info(logger, f"  N_distances : {N_distances}")
+    log_info(logger, f"  N_sizes_int : {params['N_sizes_integral']}")
 
     mem_before = _rss_mb()
     t0 = time.perf_counter()
@@ -122,17 +109,17 @@ def bench_single_call(wavelengths, params, N_distances=400):
                          "interp+zeta_int", "radial_int"]),
     ]
     for group_name, keys in phases:
-        print(f"\n  [{group_name}]")
+        log_info(logger, f"\n  [{group_name}]")
         for k in keys:
             v = timings.get(k)
             if v is not None:
                 pct = v / total * 100
                 bar = "█" * int(pct / 2)
-                print(f"    {k:30s}: {v:7.3f} s  {pct:5.1f}%  {bar}")
+                log_info(logger, f"    {k:30s}: {v:7.3f} s  {pct:5.1f}%  {bar}")
 
-    print(f"\n  Wall-clock total  : {wall:.3f} s")
+    log_info(logger, f"\n  Wall-clock total  : {wall:.3f} s")
     if _HAS_PSUTIL:
-        print(f"  Memory increase   : {mem_after - mem_before:.1f} MB")
+        log_info(logger, f"  Memory increase   : {mem_after - mem_before:.1f} MB")
     return timings
 
 
@@ -142,8 +129,8 @@ def bench_scale_wavelengths(n_wav_list, params, N_distances=400, n_runs=5):
     grain, star, _ = _make_objects()
 
     results = []
-    print(f"  {'N_wav':>6}  {'mean (s)':>9}  {'+/-':>7}")
-    print(f"  {'─'*6}  {'─'*9}  {'─'*7}")
+    log_info(logger, f"  {'N_wav':>6}  {'mean (s)':>9}  {'+/-':>7}")
+    log_info(logger, f"  {'─'*6}  {'─'*9}  {'─'*7}")
     for n in n_wav_list:
         wl = np.geomspace(1.0, 300.0, n)
         sed_obj = _make_sed(grain, star, wl, N_distances)
@@ -154,7 +141,7 @@ def bench_scale_wavelengths(n_wav_list, params, N_distances=400, n_runs=5):
             walls.append(time.perf_counter() - t0)
         mean, std = float(np.mean(walls)), float(np.std(walls))
         results.append((n, mean, std))
-        print(f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
+        log_info(logger, f"  {n:>6}  {mean:>9.3f}  {std:>7.3f}")
     return results
 
 
@@ -165,8 +152,8 @@ def bench_scale_sizes(n_sizes_list, wavelengths, N_distances=400, n_runs=5):
     sed_obj = _make_sed(grain, star, wavelengths, N_distances)
 
     results = []
-    print(f"  {'N_sizes':>8}  {'mean (s)':>9}  {'+/-':>7}")
-    print(f"  {'─'*8}  {'─'*9}  {'─'*7}")
+    log_info(logger, f"  {'N_sizes':>8}  {'mean (s)':>9}  {'+/-':>7}")
+    log_info(logger, f"  {'─'*8}  {'─'*9}  {'─'*7}")
     for n in n_sizes_list:
         p = {**BASE_DISK_PARAMS, "N_sizes_integral": n}
         walls = []
@@ -176,7 +163,7 @@ def bench_scale_sizes(n_sizes_list, wavelengths, N_distances=400, n_runs=5):
             walls.append(time.perf_counter() - t0)
         mean, std = float(np.mean(walls)), float(np.std(walls))
         results.append((n, mean, std))
-        print(f"  {n:>8}  {mean:>9.3f}  {std:>7.3f}")
+        log_info(logger, f"  {n:>8}  {mean:>9.3f}  {std:>7.3f}")
     return results
 
 
@@ -186,8 +173,8 @@ def bench_scale_distances(n_dist_list, wavelengths, params, n_runs=5):
     grain, star, _ = _make_objects()
 
     results = []
-    print(f"  {'N_dist':>7}  {'mean (s)':>9}  {'+/-':>7}")
-    print(f"  {'─'*7}  {'─'*9}  {'─'*7}")
+    log_info(logger, f"  {'N_dist':>7}  {'mean (s)':>9}  {'+/-':>7}")
+    log_info(logger, f"  {'─'*7}  {'─'*9}  {'─'*7}")
     for nd in n_dist_list:
         sed_obj = _make_sed(grain, star, wavelengths, nd)
         walls = []
@@ -197,7 +184,7 @@ def bench_scale_distances(n_dist_list, wavelengths, params, n_runs=5):
             walls.append(time.perf_counter() - t0)
         mean, std = float(np.mean(walls)), float(np.std(walls))
         results.append((nd, mean, std))
-        print(f"  {nd:>7}  {mean:>9.3f}  {std:>7.3f}")
+        log_info(logger, f"  {nd:>7}  {mean:>9.3f}  {std:>7.3f}")
     return results
 
 
@@ -215,12 +202,12 @@ def bench_cprofile(wavelengths, params, N_distances=400, out_file="benchmark_sed
     stream = io.StringIO()
     ps = pstats.Stats(pr, stream=stream).sort_stats("cumulative")
     ps.print_stats(30)
-    print(stream.getvalue())
+    log_info(logger, stream.getvalue())
 
     if out_file:
         pr.dump_stats(out_file)
-        print(f"  Full profile saved to: {out_file}")
-        print(f"  Inspect with:  python -m pstats {out_file}")
+        log_info(logger, f"  Full profile saved to: {out_file}")
+        log_info(logger, f"  Inspect with:  python -m pstats {out_file}")
 
 
 # ── scaling plot ──────────────────────────────────────────────────────────────
@@ -260,7 +247,7 @@ def plot_scaling(wav_results, size_results, dist_results, out="benchmark_sed_sca
 
     plt.tight_layout()
     plt.savefig(out, dpi=120)
-    print(f"\n  Scaling plot saved to: {out}")
+    log_info(logger, f"\n  Scaling plot saved to: {out}")
     plt.close()
 
 
@@ -290,9 +277,9 @@ def main():
         params        = {**BASE_DISK_PARAMS, "N_sizes_integral": 200}
         n_dist_ref    = 400
 
-    print("=" * 70)
-    print("pyGrater — SED benchmark")
-    print("=" * 70)
+    log_info(logger, "=" * 70)
+    log_info(logger, "pyGrater — SED benchmark")
+    log_info(logger, "=" * 70)
 
     bench_single_call(wavelengths, params, N_distances=n_dist_ref)
 
@@ -308,7 +295,7 @@ def main():
         plot_scaling(wav_results, size_results, dist_results)
 
     _divider()
-    print("Done.")
+    log_info(logger, "Done.")
 
 
 if __name__ == "__main__":

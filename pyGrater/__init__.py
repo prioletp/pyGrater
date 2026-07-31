@@ -1,61 +1,42 @@
-# from . import optical_properties
-# from . import (
-#     stargrains
-    
-    
-# )
-from pyGrater.config.logging_config import redirect_print_to_log
-redirect_print_to_log()
+"""Public pyGrater API."""
 
-from pyGrater.stargrains import Grain, Star
+from pyGrater.config.logging_config import configure_logging, setup_logger
+
+configure_logging()
+
 from pyGrater.add_materials import add_material
 from pyGrater.add_stars import add_star
-from pyGrater.temperatures import Temperature
-from pyGrater.fluxes import Fluxes
 from pyGrater.config.paths import DataPathConfig
-from pyGrater.SED import SED
+from pyGrater.fluxes import Fluxes
 from pyGrater.image import Image
+from pyGrater.SED import SED
+from pyGrater.SED_cached import CachedSED, SharedSEDCache
+from pyGrater.stargrains import Grain, Star
+from pyGrater.temperatures import Temperature
+
 def set_data_path(path, persistent=True):
-    """
-    Configure the path to pyGrater data folder.
-    
-    Parameters
-    ----------
-    path : str or Path
-        Path to the pyGrater data folder
-    persistent : bool, optional
-        If True, saves configuration to ~/.pygrater/config.yaml (default)
-        If False, sets only for current Python session
-    
-    Examples
-    --------
-    >>> import pyGrater
-    >>> pyGrater.set_data_path('/Users/username/pyGrater_data')
-    Data path saved to /Users/username/.pygrater/config.yaml
-    """
+    """Set the external pyGrater data directory."""
     return DataPathConfig.set_data_path(path, persistent)
 
+
 def get_data_path():
-    """
-    Get the currently configured data path.
-    
-    Returns
-    -------
-    Path
-        Path to the pyGrater data folder
-    
-    Raises
-    ------
-    FileNotFoundError
-        If data path is not configured
-    
-    Examples
-    --------
-    >>> import pyGrater
-    >>> pyGrater.get_data_path()
-    PosixPath('/Users/username/pyGrater_data')
-    """
+    """Return the configured external pyGrater data directory."""
     return DataPathConfig.get_data_path()
 
-# If you have __all__, add these functions
-# __all__ = ['set_data_path', 'get_data_path', ...]
+
+__all__ = [
+    "Fluxes",
+    "Grain",
+    "Image",
+    "SED",
+    "CachedSED",
+    "SharedSEDCache",
+    "Star",
+    "Temperature",
+    "add_material",
+    "add_star",
+    "configure_logging",
+    "get_data_path",
+    "set_data_path",
+    "setup_logger",
+]

@@ -29,12 +29,16 @@ group          : str    — mineral group (default: '')
 reference      : str    — bibliographic reference (default: '')
 web            : str    — URL (default: '')
 """
+import logging
 
 from pathlib import Path
 import pyGrater
 
 
 # Column order as found in material_list.txt
+
+
+logger = logging.getLogger(__name__)
 _COLUMNS = [
     "Nickname",
     "Wav_min[microns]",
@@ -164,7 +168,7 @@ def add_material(
     with open(material_list_path, "a", encoding="utf-8") as f:
         f.write("\n" + new_row)
 
-    print(f"Material '{nickname}' added to {material_list_path}")
+    logger.info(f"Material '{nickname}' added to {material_list_path}")
 
 
 # ---------------------------------------------------------------------------

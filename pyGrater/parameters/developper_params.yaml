@@ -1,8 +1,8 @@
 # For Q calculation
 size_min: 0.0099999999  # in micrometers
-size_max: 3000.0000001  # in micrometers
+size_max: 1000.0000001  # in micrometers
 
-waves_min: 0.32000001  # in micrometers
+waves_min: 0.04008001  # in micrometers
 waves_max: 1980  # in micrometers
 
 N_sizes: 600

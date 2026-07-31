@@ -1,8 +1,12 @@
+import logging
 import argparse
 import sys
 from pathlib import Path
 from pyGrater.config.paths import DataPathConfig
 
+
+from pyGrater.config.logging_config import log_info
+logger = logging.getLogger(__name__)
 def main():
     """Command-line interface for pyGrater data setup"""
     parser = argparse.ArgumentParser(
@@ -39,10 +43,10 @@ Examples:
     if args.show:
         try:
             current_path = DataPathConfig.get_data_path()
-            print(f"✓ Data path configured: {current_path}")
+            log_info(logger, f"✓ Data path configured: {current_path}")
         except FileNotFoundError:
-            print(f"✗ Data path not configured")
-            print("\nRun: pygrater-setup --data-path /path/to/data")
+            log_info(logger, f"✗ Data path not configured")
+            log_info(logger, "\nRun: pygrater-setup --data-path /path/to/data")
         return
     
     if args.data_path:
@@ -53,21 +57,21 @@ Examples:
                 required_dirs = ['optical_properties', 'efficiencies', 'star_data', 'temperatures']
                 missing = [d for d in required_dirs if not (path / d).exists()]
                 if missing:
-                    print(f"⚠ Warning: Missing directories: {', '.join(missing)}")
+                    log_info(logger, f"⚠ Warning: Missing directories: {', '.join(missing)}")
                     response = input("Continue anyway? (y/n): ")
                     if response.lower() != 'y':
                         sys.exit(1)
             
             DataPathConfig.set_data_path(path, persistent=True)
-            print(f"✓ Data path successfully configured!")
-            print(f"  Location: {path}")
-            print(f"  Config saved to: {DataPathConfig.CONFIG_FILE}")
+            log_info(logger, f"✓ Data path successfully configured!")
+            log_info(logger, f"  Location: {path}")
+            log_info(logger, f"  Config saved to: {DataPathConfig.CONFIG_FILE}")
             
         except FileNotFoundError as e:
-            print(f"✗ Error: {e}")
+            log_info(logger, f"✗ Error: {e}")
             sys.exit(1)
         except Exception as e:
-            print(f"✗ Unexpected error: {e}")
+            log_info(logger, f"✗ Unexpected error: {e}")
             sys.exit(1)
     else:
         parser.print_help()

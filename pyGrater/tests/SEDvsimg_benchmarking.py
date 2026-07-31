@@ -1,5 +1,9 @@
+import logging
 #%%
 
+
+from pyGrater.config.logging_config import log_info
+logger = logging.getLogger(__name__)
 """
 Benchmark comparison between SED generation and image generation.
 
@@ -22,7 +26,7 @@ from pyGrater.density import two_power_law
 from pyGrater.size_distributions import power_law_distribution
 from pyGrater.phase_functions import isotropic as phase_function
 from pyGrater.image import Image
-from pyGrater.SED import SED
+from pyGrater.SED_old import SED
 # FOV_AU = 1
 def get_memory_usage():
     """Get current memory usage in MB."""
@@ -55,14 +59,14 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
     else:
         wavelengths = np.asarray(wavelengths)
     
-    print("="*70)
-    print("SED vs IMAGE GENERATION BENCHMARK")
-    print("="*70)
-    print(f"Wavelengths: {wavelengths} µm")
-    print(f"Image size: {nx}x{ny}")
-    print(f"Field of view: {FOV_AU} AU")
-    print(f"Number of runs: {n_runs}")
-    print()
+    log_info(logger, "="*70)
+    log_info(logger, "SED vs IMAGE GENERATION BENCHMARK")
+    log_info(logger, "="*70)
+    log_info(logger, f"Wavelengths: {wavelengths} µm")
+    log_info(logger, f"Image size: {nx}x{ny}")
+    log_info(logger, f"Field of view: {FOV_AU} AU")
+    log_info(logger, f"Number of runs: {n_runs}")
+    log_info(logger, )
     
     # Setup
     grain = Grain(redo_Q=False, composition='astroSi')  # Load precomputed optical efficiencies
@@ -76,8 +80,8 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
     }
     
     # Benchmark SED generation
-    print("Testing SED generation...")
-    print("-" * 70)
+    log_info(logger, "Testing SED generation...")
+    log_info(logger, "-" * 70)
     
     sed_gen = SED(grain, star, two_power_law, power_law_distribution, wavelengths)
     times_sed = []
@@ -96,19 +100,19 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
         times_sed.append(elapsed)
         mem_sed.append(mem_used)
         
-        print(f"  Run {run+1}: {elapsed:.3f}s, Memory: {mem_used:.1f} MB")
+        log_info(logger, f"  Run {run+1}: {elapsed:.3f}s, Memory: {mem_used:.1f} MB")
     
     time_sed_avg = np.mean(times_sed)
     time_sed_std = np.std(times_sed)
     mem_sed_avg = np.mean(mem_sed)
     
-    print(f"✓ SED average: {time_sed_avg:.3f}s ± {time_sed_std:.3f}s")
-    print(f"  Memory: {mem_sed_avg:.1f} MB")
-    print()
+    log_info(logger, f"✓ SED average: {time_sed_avg:.3f}s ± {time_sed_std:.3f}s")
+    log_info(logger, f"  Memory: {mem_sed_avg:.1f} MB")
+    log_info(logger, )
     
     # Benchmark Image generation
-    print("Testing Image generation...")
-    print("-" * 70)
+    log_info(logger, "Testing Image generation...")
+    log_info(logger, "-" * 70)
     
     img_gen = Image(grain, star, two_power_law, power_law_distribution,
                     phase_function, wavelengths)
@@ -125,7 +129,7 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
         images_sca, images_therm = img_gen.get_image(
             keep_separate_fluxes=True, **test_params
         )
-        print('RMAX:', img_gen.rmax)
+        log_info(logger, 'RMAX:', img_gen.rmax)
 
         elapsed = time.time() - start
         mem_used = get_memory_usage() - mem_start
@@ -139,7 +143,7 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
         image_fluxes_sca.append(flux_sca)
         image_fluxes_therm.append(flux_therm)
         
-        print(f"  Run {run+1}: {elapsed:.3f}s, Memory: {mem_used:.1f} MB")
+        log_info(logger, f"  Run {run+1}: {elapsed:.3f}s, Memory: {mem_used:.1f} MB")
     
     time_img_avg = np.mean(times_img)
     time_img_std = np.std(times_img)
@@ -150,27 +154,27 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
     avg_flux_therm = np.mean(image_fluxes_therm, axis=0)
     avg_flux_total_img = avg_flux_sca + avg_flux_therm
     
-    print(f"✓ Image average: {time_img_avg:.3f}s ± {time_img_std:.3f}s")
-    print(f"  Memory: {mem_img_avg:.1f} MB")
-    print()
+    log_info(logger, f"✓ Image average: {time_img_avg:.3f}s ± {time_img_std:.3f}s")
+    log_info(logger, f"  Memory: {mem_img_avg:.1f} MB")
+    log_info(logger, )
     
     # Performance comparison
     speedup = time_img_avg / time_sed_avg
     
-    print("="*70)
-    print("PERFORMANCE COMPARISON")
-    print("="*70)
-    print(f"SED:   {time_sed_avg:.3f}s ± {time_sed_std:.3f}s")
-    print(f"Image: {time_img_avg:.3f}s ± {time_img_std:.3f}s")
-    print(f"Ratio: Image is {speedup:.2f}x {'slower' if speedup > 1 else 'faster'} than SED")
-    print(f"Memory: SED {mem_sed_avg:.1f} MB, Image {mem_img_avg:.1f} MB")
-    print()
+    log_info(logger, "="*70)
+    log_info(logger, "PERFORMANCE COMPARISON")
+    log_info(logger, "="*70)
+    log_info(logger, f"SED:   {time_sed_avg:.3f}s ± {time_sed_std:.3f}s")
+    log_info(logger, f"Image: {time_img_avg:.3f}s ± {time_img_std:.3f}s")
+    log_info(logger, f"Ratio: Image is {speedup:.2f}x {'slower' if speedup > 1 else 'faster'} than SED")
+    log_info(logger, f"Memory: SED {mem_sed_avg:.1f} MB, Image {mem_img_avg:.1f} MB")
+    log_info(logger, )
     
     # Flux comparison
-    print("="*70)
+    log_info(logger, "="*70)
     
-    print("FLUX CONSISTENCY CHECK")
-    print("="*70)
+    log_info(logger, "FLUX CONSISTENCY CHECK")
+    log_info(logger, "="*70)
     
     # Compare SED flux to integrated image flux
     sed_total = sed_therm + sed_sca
@@ -183,11 +187,11 @@ def benchmark_sed_vs_image(wavelengths=None, nx=256, ny=256, FOV_AU=1, n_runs=3)
     norm_factor_ratio = image_norm_factor / sed_norm_factor if np.isfinite(sed_norm_factor) and sed_norm_factor != 0 else np.nan
 
     for i, wave in enumerate(wavelengths):
-        print(f"λ = {wave:.2f} µm:")
-        print(f"  SED flux:   {sed_total[i]:.3e}")
-        print(f"  Image flux: {avg_flux_total_img[i]:.3e}")
-        print(f"  Ratio:      {flux_ratio[i]:.4f}")
-        print(f"  Difference: {flux_diff_percent[i]:+.2f}%")
+        log_info(logger, f"λ = {wave:.2f} µm:")
+        log_info(logger, f"  SED flux:   {sed_total[i]:.3e}")
+        log_info(logger, f"  Image flux: {avg_flux_total_img[i]:.3e}")
+        log_info(logger, f"  Ratio:      {flux_ratio[i]:.4f}")
+        log_info(logger, f"  Difference: {flux_diff_percent[i]:+.2f}%")
     
     return {
         'wavelengths': wavelengths,
@@ -389,9 +393,9 @@ def plot_comparison(results):
     return fig
 
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("SED vs IMAGE BENCHMARK SUITE")
-    print("="*70 + "\n")
+    log_info(logger, "\n" + "="*70)
+    log_info(logger, "SED vs IMAGE BENCHMARK SUITE")
+    log_info(logger, "="*70 + "\n")
     
     # Test 1: Few wavelengths
     # print("\n### TEST 1: Few wavelengths (3) ###\n")
@@ -401,16 +405,16 @@ if __name__ == "__main__":
     # )
     
     # Test 2: Many wavelengths
-    print("\n### TEST 2: Many wavelengths (50) ###\n")
+    log_info(logger, "\n### TEST 2: Many wavelengths (50) ###\n")
     results_many = benchmark_sed_vs_image(
         wavelengths=np.linspace(2, 50, 5),
         nx=128, ny=128, n_runs=1, FOV_AU=800
     )
     
     # Generate plots
-    print("\n" + "="*70)
-    print("GENERATING PLOTS")
-    print("="*70)
+    log_info(logger, "\n" + "="*70)
+    log_info(logger, "GENERATING PLOTS")
+    log_info(logger, "="*70)
     
     # fig1 = plot_comparison(results_few)
     # fig1.savefig('benchmark_SEDvsimg_few.png', dpi=150, bbox_inches='tight')
@@ -418,9 +422,9 @@ if __name__ == "__main__":
     
     fig2 = plot_comparison(results_many)
     fig2.savefig('benchmark_SEDvsimg_many.png', dpi=150, bbox_inches='tight')
-    print("✓ Saved: benchmark_SEDvsimg_many.png")
+    log_info(logger, "✓ Saved: benchmark_SEDvsimg_many.png")
     
     plt.show()
     
-    print("\nBenchmark complete!")
+    log_info(logger, "\nBenchmark complete!")
 # %%

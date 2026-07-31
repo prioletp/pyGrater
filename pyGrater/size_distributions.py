@@ -1,36 +1,40 @@
-#%%
+"""Dust grain-size distributions."""
+import logging
+
 import numpy as np
 from scipy.integrate import quad
 
-def normalize_power_law(size_distribution_function, args_size_dist_func):
-    a_min = args_size_dist_func['a_min']
-    a_max = args_size_dist_func['a_max']
-    normalization_factor = quad(size_distribution_function, a_min, a_max, args=args_size_dist_func)[0]
+
+
+
+logger = logging.getLogger(__name__)
+def normalize_power_law(size_distribution_function, parameters):
+    """Numerically integrate a scalar size-distribution function."""
+    minimum_grain_size_m = parameters['a_min']
+    maximum_grain_size_m = parameters['a_max']
+    normalization_factor = quad(
+        size_distribution_function,
+        minimum_grain_size_m,
+        maximum_grain_size_m,
+        args=parameters)[0]
     return normalization_factor
 
-# All definitions of size distributions must be under the form distribution(sizes, parameters)
 
-def power_law_distribution(sizes, parameters):
-    """
-    Generate a power-law size distribution.
-
-    Parameters:
-    - sizes: Array of grain sizes (numpy array)
-    - power_index: Power-law index (float)
-
-    Returns:
-    - sizes: Distribution of grain sizes following the power-law (numpy array)
-    """
-    power_index = parameters['kappa']
-    a_min = parameters['a_min']
-    a_max = parameters['a_max']
-    if power_index == 1:
-        # Special case to avoid division by zero in normalization
-        distribution = sizes**(-power_index) / np.log(a_max / a_min)
+def power_law_distribution(grain_sizes_m, parameters):
+    """Return a normalized ``dn/da proportional to a^-kappa`` distribution."""
+    power_law_index = parameters['kappa']
+    minimum_grain_size_m = parameters['a_min']
+    maximum_grain_size_m = parameters['a_max']
+    if power_law_index == 1:
+        distribution = (
+            grain_sizes_m**(-power_law_index)
+            / np.log(maximum_grain_size_m / minimum_grain_size_m))
     else:
-        distribution = (1-power_index)*sizes**(-power_index)/(a_max**(1-power_index)- a_min**(1-power_index))
-    
-    return distribution    
+        distribution = (
+            (1.0 - power_law_index) * grain_sizes_m**(-power_law_index)
+            / (maximum_grain_size_m**(1.0 - power_law_index)
+               - minimum_grain_size_m**(1.0 - power_law_index)))
+    return distribution
 
 
 #%%
@@ -46,7 +50,7 @@ if __name__ == "__main__":
      # Example usage
     distribution = power_law_distribution(sizes, dic)
     norm_factor = normalize_power_law(power_law_distribution, dic)
-    print('The normalization factor is:', norm_factor)
+    logger.info('%s %s', 'The normalization factor is:', norm_factor)
     plt.semilogx(sizes, distribution)
     # print('Integral over full range (should be 1):', integrate_test(power_index, a_min, a_max))
     # Example integration

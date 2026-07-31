@@ -18,7 +18,8 @@ pyGrater is a Python package for computing grain temperatures, scattering/emissi
 **Key features:**
 - Mie theory grain efficiency calculations (Qabs, Qsca, Qpr)
 - Grain temperature equilibrium as a function of stellar type and distance
-- SED and image generation for optically thin disks
+- Optimized SED and image generation for optically thin disks
+- One shared `Fluxes` radiative-transfer implementation for SEDs and images
 - Support for a wide range of grain compositions and stellar spectra
 
 ---
@@ -88,6 +89,51 @@ temp = pyGrater.Temperature(grain, star)
 ```
 
 See the `examples/` folder for full Jupyter notebook tutorials.
+
+---
+
+## Fitting Models
+
+SciPy, emcee, nested-sampling, field-of-view, and interferometric fitters live
+in the separate `pyGraterFit` package:
+
+```python
+from pyGraterFit import SingleRingSEDScipyFitter, SingleRingSEDMCMCFitter
+```
+
+Its README and `examples/` directory document single-component,
+multi-ring/multi-composition, restartable MCMC, nested-sampling, and
+interferometric workflows.
+
+---
+
+## Performance
+
+The public `SED`, `Image`, and `Fluxes` classes are the fastest validated
+implementations developed for repeated fitting. The first call includes Numba
+compilation; the values below describe warmed repeated evaluations.
+
+### SED timing
+
+The SED was benchmarked using HD113766 and `c_olivine_Fe_Poor`.
+
+| Wavelengths | Previous | Current | Additional speedup |
+|---:|---:|---:|---:|
+| 4 | 0.169 s | 0.127 s | 1.34x |
+| 16 | 0.159 s | 0.080 s | 1.99x |
+| 64 | 0.156 s | 0.136 s | 1.15x |
+| 128 | 0.167 s | 0.151 s | 1.11x |
+| 256 | 0.246 s | 0.206 s | 1.20x |
+| 500 | 0.418 s | 0.372 s | 1.12x |
+
+These are representative median warmed timings on the development machine;
+absolute times depend on CPU, thread count, and wavelength/parameter choices.
+The 500-wavelength row used 10 repeated parameter draws to reduce timing
+noise.
+
+The implementation automatically selects the most efficient thermal-emission
+kernel for small and large wavelength grids. It avoids constructing
+wavelength-by-distance arrays during ordinary disk-integrated SED fitting.
 
 ---
 
@@ -198,18 +244,19 @@ python -m pyGrater.add_materials --nickname my_dust --Tsub 1700 \
 
 ## Logging
 
-Every `print()` call in pyGrater is automatically mirrored to a timestamped log file when the package is imported.
-
-**Default location:** `<cwd>/logs/pyGrater_YYYYMMDD_HHMMSS.log`
+pyGrater uses the standard Python `logging` module. Importing `pyGrater`
+configures a console INFO handler for the package logger, and file logging is
+opt-in.
 
 ```python
-# Change the log directory
+import logging
 import pyGrater
-pyGrater.redirect_print_to_log("/path/to/my/logs")
 
-# Disable file logging
-import sys
-sys.stdout = sys.stdout._original
+# Show more detailed pyGrater messages
+pyGrater.configure_logging(level=logging.DEBUG)
+
+# Also write pyGrater logs to a timestamped file
+pyGrater.configure_logging(log_to_file=True, log_dir="/path/to/my/logs")
 ```
 
 ---
@@ -221,4 +268,3 @@ sys.stdout = sys.stdout._original
 | `FileNotFoundError` for data path | Run `pygrater-setup --data-path /path` or set `PYGRATER_DATA_PATH` |
 | `ValueError: Unknown star` | Check spelling; ensure the name exists in `stars_main_properties.txt` |
 | Slow first run for a composition | Efficiency files are computed once and cached — subsequent runs are fast |
-

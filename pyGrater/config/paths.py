@@ -1,7 +1,11 @@
+import logging
 import os
 import json
 from pathlib import Path
 
+
+
+logger = logging.getLogger(__name__)
 class DataPathConfig:
     """Manage data folder paths for pyGrater"""
     
@@ -48,9 +52,9 @@ class DataPathConfig:
             cls.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(cls.CONFIG_FILE, 'w') as f:
                 json.dump({'data_path': str(path)}, f, indent=2)
-            print(f"Data path saved to {cls.CONFIG_FILE}")
+            logger.info(f"Data path saved to {cls.CONFIG_FILE}")
         else:
             os.environ[cls.ENV_VAR] = str(path)
-            print(f"Data path set for current session")
+            logger.info(f"Data path set for current session")
         
         return path

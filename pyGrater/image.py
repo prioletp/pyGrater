@@ -1,104 +1,372 @@
-#%%
-from pyGrater.utils import cylinder, hyperboloid_2_sheets, calculate_normalization_density, calculate_normalization_density_jacobian_sublimation_fast as calculate_normalization_density_jacobian_sublimation
-from pyGrater import Fluxes
+"""
+image.py -- exact-output optimized image engine.
+
+This module keeps the same numerical ingredients as ``pyGrater.image.Image``.
+Grain emission is supplied by the same ``Fluxes`` class in
+``fluxes`` that underlies ``SED``. The speedups come from
+specialized image integration while retaining that common radiative-transfer
+implementation.
+"""
+
+import logging
 import time
-import matplotlib.pyplot as plt
+
+import astropy.constants as cst
 import numpy as np
 import scipy
 import scipy.integrate
 from scipy.interpolate import RegularGridInterpolator
-import astropy.constants as cst
 from tqdm import tqdm
 
-from pyGrater.config.logging_config import setup_logger 
-logger = setup_logger(__name__, log_to_file=True)
+from pyGrater.constants import (
+    DEFAULT_IMAGE_PIXEL_SCALE_AU,
+    MINIMUM_IMAGE_SCALED_HEIGHT,
+    N_IMAGE_VERTICAL_GRID_POINTS,
+    PIXEL_MAJOR_DENSITY_THRESHOLD,
+)
+from pyGrater.density import two_power_law_numba
+from pyGrater.fluxes import Fluxes
+from pyGrater.utils import (
+    calculate_normalization_density_jacobian_sublimation_vfast
+    as calculate_normalization_density_jacobian_sublimation,
+    cylinder,
+    hyperboloid_2_sheets,
+)
 
 
+try:
+    from numba import njit, prange
 
-#%%   
+    @njit(parallel=True, cache=True)
+    def _integrate_total_numba(
+            dust_thermal_emission_by_distance,
+            scattered_starlight_before_angular_dependence,
+            scattering_phase_function_by_angle,
+                               density_vals,
+                               rho_idx, rho_t, rho_oob,
+                               ang_idx, ang_t, ang_oob,
+                               line_of_sight_path_length_au,
+                               pixel_area, norm_factor):
+        n_w, _ = dust_thermal_emission_by_distance.shape
+        n_l, n_pix = density_vals.shape
+        out = np.zeros((n_w, n_pix))
+        inv_n = 1.0 / (n_l - 1.0)
+        for w in prange(n_w):
+            for p in range(n_pix):
+                acc = 0.0
+                for l in range(n_l):
+                    k = l * n_pix + p
+                    val = 0.0
+                    if not rho_oob[k]:
+                        ir = rho_idx[k]
+                        tr = rho_t[k]
+                        therm = ((1.0 - tr)
+                                 * dust_thermal_emission_by_distance[w, ir]
+                                 + tr
+                                 * dust_thermal_emission_by_distance[w, ir + 1])
+                        scat = 0.0
+                        if not ang_oob[k]:
+                            ia = ang_idx[k]
+                            ta = ang_t[k]
+                            distance_dependent_scattered_starlight = (
+                                (1.0 - tr)
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir]
+                                + tr
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir + 1])
+                            scattering_angular_dependence = (
+                                (1.0 - ta)
+                                * scattering_phase_function_by_angle[ia]
+                                + ta
+                                * scattering_phase_function_by_angle[ia + 1])
+                            scat = (distance_dependent_scattered_starlight
+                                    * scattering_angular_dependence)
+                        val = (therm + scat) * density_vals[l, p]
+                    line_of_sight_integration_coefficient = (
+                        0.5 if (l == 0 or l == n_l - 1) else 1.0)
+                    acc += line_of_sight_integration_coefficient * val
+                out[w, p] = (acc * inv_n
+                             * line_of_sight_path_length_au[p]
+                             * pixel_area * norm_factor)
+        return out
+
+    @njit(parallel=True, cache=True)
+    def _integrate_separate_numba(
+            dust_thermal_emission_by_distance,
+            scattered_starlight_before_angular_dependence,
+            scattering_phase_function_by_angle,
+                                  density_vals,
+                                  rho_idx, rho_t, rho_oob,
+                                  ang_idx, ang_t, ang_oob,
+                                  line_of_sight_path_length_au,
+                                  pixel_area, norm_factor):
+        n_w, _ = dust_thermal_emission_by_distance.shape
+        n_l, n_pix = density_vals.shape
+        out_sca = np.zeros((n_w, n_pix))
+        out_therm = np.zeros((n_w, n_pix))
+        inv_n = 1.0 / (n_l - 1.0)
+        for w in prange(n_w):
+            for p in range(n_pix):
+                acc_sca = 0.0
+                acc_therm = 0.0
+                for l in range(n_l):
+                    k = l * n_pix + p
+                    therm = 0.0
+                    scat = 0.0
+                    if not rho_oob[k]:
+                        ir = rho_idx[k]
+                        tr = rho_t[k]
+                        therm = ((1.0 - tr)
+                                 * dust_thermal_emission_by_distance[w, ir]
+                                 + tr
+                                 * dust_thermal_emission_by_distance[w, ir + 1])
+                        if not ang_oob[k]:
+                            ia = ang_idx[k]
+                            ta = ang_t[k]
+                            distance_dependent_scattered_starlight = (
+                                (1.0 - tr)
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir]
+                                + tr
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir + 1])
+                            scattering_angular_dependence = (
+                                (1.0 - ta)
+                                * scattering_phase_function_by_angle[ia]
+                                + ta
+                                * scattering_phase_function_by_angle[ia + 1])
+                            scat = (distance_dependent_scattered_starlight
+                                    * scattering_angular_dependence)
+                        dens = density_vals[l, p]
+                        therm *= dens
+                        scat *= dens
+                    line_of_sight_integration_coefficient = (
+                        0.5 if (l == 0 or l == n_l - 1) else 1.0)
+                    acc_sca += line_of_sight_integration_coefficient * scat
+                    acc_therm += line_of_sight_integration_coefficient * therm
+                scale = (inv_n * line_of_sight_path_length_au[p]
+                         * pixel_area * norm_factor)
+                out_sca[w, p] = acc_sca * scale
+                out_therm[w, p] = acc_therm * scale
+        return out_sca, out_therm
+
+    @njit(parallel=True, cache=True)
+    def _integrate_total_pixel_major_numba(
+            dust_thermal_emission_by_distance,
+            scattered_starlight_before_angular_dependence,
+            scattering_phase_function_by_angle, density_pm,
+            rho_idx_pm, rho_t_pm, rho_oob_pm,
+            ang_idx_pm, ang_t_pm, ang_oob_pm,
+            line_of_sight_path_length_au, pixel_area, norm_factor):
+        n_w, _ = dust_thermal_emission_by_distance.shape
+        n_pix, n_l = density_pm.shape
+        out = np.zeros((n_w, n_pix))
+        inv_n = 1.0 / (n_l - 1.0)
+        for w in prange(n_w):
+            for p in range(n_pix):
+                acc = 0.0
+                for l in range(n_l):
+                    val = 0.0
+                    if not rho_oob_pm[p, l]:
+                        ir = rho_idx_pm[p, l]
+                        tr = rho_t_pm[p, l]
+                        therm = ((1.0 - tr)
+                                 * dust_thermal_emission_by_distance[w, ir]
+                                 + tr
+                                 * dust_thermal_emission_by_distance[w, ir + 1])
+                        scat = 0.0
+                        if not ang_oob_pm[p, l]:
+                            ia = ang_idx_pm[p, l]
+                            ta = ang_t_pm[p, l]
+                            distance_dependent_scattered_starlight = (
+                                (1.0 - tr)
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir]
+                                + tr
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir + 1])
+                            scattering_angular_dependence = (
+                                (1.0 - ta)
+                                * scattering_phase_function_by_angle[ia]
+                                + ta
+                                * scattering_phase_function_by_angle[ia + 1])
+                            scat = (distance_dependent_scattered_starlight
+                                    * scattering_angular_dependence)
+                        val = (therm + scat) * density_pm[p, l]
+                    line_of_sight_integration_coefficient = (
+                        0.5 if (l == 0 or l == n_l - 1) else 1.0)
+                    acc += line_of_sight_integration_coefficient * val
+                out[w, p] = (
+                    acc * inv_n * line_of_sight_path_length_au[p]
+                    * pixel_area * norm_factor)
+        return out
+
+    @njit(parallel=True, cache=True)
+    def _integrate_separate_pixel_major_numba(
+            dust_thermal_emission_by_distance,
+            scattered_starlight_before_angular_dependence,
+            scattering_phase_function_by_angle, density_pm,
+            rho_idx_pm, rho_t_pm, rho_oob_pm,
+            ang_idx_pm, ang_t_pm, ang_oob_pm,
+            line_of_sight_path_length_au, pixel_area, norm_factor):
+        n_w, _ = dust_thermal_emission_by_distance.shape
+        n_pix, n_l = density_pm.shape
+        out_sca = np.zeros((n_w, n_pix))
+        out_therm = np.zeros((n_w, n_pix))
+        inv_n = 1.0 / (n_l - 1.0)
+        for w in prange(n_w):
+            for p in range(n_pix):
+                acc_sca = 0.0
+                acc_therm = 0.0
+                for l in range(n_l):
+                    therm = 0.0
+                    scat = 0.0
+                    if not rho_oob_pm[p, l]:
+                        ir = rho_idx_pm[p, l]
+                        tr = rho_t_pm[p, l]
+                        therm = ((1.0 - tr)
+                                 * dust_thermal_emission_by_distance[w, ir]
+                                 + tr
+                                 * dust_thermal_emission_by_distance[w, ir + 1])
+                        if not ang_oob_pm[p, l]:
+                            ia = ang_idx_pm[p, l]
+                            ta = ang_t_pm[p, l]
+                            distance_dependent_scattered_starlight = (
+                                (1.0 - tr)
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir]
+                                + tr
+                                * scattered_starlight_before_angular_dependence[
+                                    w, ir + 1])
+                            scattering_angular_dependence = (
+                                (1.0 - ta)
+                                * scattering_phase_function_by_angle[ia]
+                                + ta
+                                * scattering_phase_function_by_angle[ia + 1])
+                            scat = (distance_dependent_scattered_starlight
+                                    * scattering_angular_dependence)
+                        dens = density_pm[p, l]
+                        therm *= dens
+                        scat *= dens
+                    line_of_sight_integration_coefficient = (
+                        0.5 if (l == 0 or l == n_l - 1) else 1.0)
+                    acc_sca += line_of_sight_integration_coefficient * scat
+                    acc_therm += line_of_sight_integration_coefficient * therm
+                scale = (inv_n * line_of_sight_path_length_au[p]
+                         * pixel_area * norm_factor)
+                out_sca[w, p] = acc_sca * scale
+                out_therm[w, p] = acc_therm * scale
+        return out_sca, out_therm
+
+    _NUMBA_IMAGE_AVAILABLE = True
+except ImportError:
+    _NUMBA_IMAGE_AVAILABLE = False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _place_line_of_sight_values_on_sky(values, visible_pixel_mask,
+                                       n_east_west_pixels,
+                                       n_north_south_pixels):
+    """Restore flattened visible pixels to North-up, East-left images.
+
+    Geometry is calculated internally with East-West as the first array axis.
+    The returned image follows the public convention: row 0 is North and
+    columns increase toward West, as in a conventional astronomical image.
+    """
+    values = np.atleast_2d(values)
+    internal_images = np.zeros(
+        (values.shape[0], n_east_west_pixels * n_north_south_pixels),
+        dtype=values.dtype)
+    internal_images[:, visible_pixel_mask.ravel()] = values
+    internal_images = internal_images.reshape(
+        values.shape[0], n_east_west_pixels, n_north_south_pixels)
+    return np.flip(np.transpose(internal_images, (0, 2, 1)), axis=1)
+
+
 class Image:
-    def __init__(self, grain, star, density_function, size_distribution_function, scattering_phase_function, wavelengths_for_calc, **kwargs):
+    """Generate disk images with North up and East toward the left.
+
+    ``PA`` is measured east of North.  Consequently PA=0 degrees places an
+    axisymmetric inclined disk's major axis North-South, while PA=90 degrees
+    places it East-West.
+    """
+
+    def __init__(self, grain, star, density_function,
+                 size_distribution_function, scattering_phase_function,
+                 wavelengths_for_calc, **kwargs):
         self.grain = grain
         self.star = star
         self.density_function = density_function
         self.size_distribution_function = size_distribution_function
         self.scattering_phase_function = scattering_phase_function
 
-        self.flux_obj = Fluxes(grain, star, wavelengths_for_calc, size_distribution_function, scattering_phase_function)
+        self.radiative_transfer = Fluxes(
+            grain, star, wavelengths_for_calc, size_distribution_function,
+            scattering_phase_function)
         self.wavelengths_for_calc = wavelengths_for_calc
-        self.distances_for_flux = self.flux_obj.distances_for_flux
-        self.scattering_angles = self.flux_obj.scattering_angles
-        
-        N_zeta = 401  # odd so that zeta=0 is included
-        half = (N_zeta - 1) // 2
-        zeta_min = 1e-3
-        positive_zeta = np.geomspace(zeta_min, 1.0, half)
-        negative_zeta = -positive_zeta[::-1]
-        self.zeta = np.concatenate((negative_zeta, [0.0], positive_zeta))  # shape: (N_zeta,)
-    def _build_z_grid(self, kwargs):
-        """Build 2D z grid with Z_max(r) per radius using change of variables zeta=z/Z_max(r)."""
-        r     = self.distances_for_flux  # (n_r,)
-        r0    = kwargs['r0']
-        h0    = kwargs['h0']
-        beta  = kwargs['beta']
-        gamma = kwargs['gamma']
-        # Use same p as image geometry so normalization domains are consistent
-        p     = kwargs.get('p_cutoff', 0.005)
+        self.stellocentric_distances_au = (
+            self.radiative_transfer.stellocentric_distances_au)
+        self.scattering_angles_radian = (
+            self.radiative_transfer.scattering_angles_radian)
+        self.timings = {}
+        self._pixel_grid_cache = {}
+        self._ln_cache = {}
 
-        Z_max_r = self.Z0 * np.sqrt(1 + (self.distances_for_flux**2) / self.rmax**2)
-#h0 * (r / r0) ** beta * (np.log(1.0 / p)) ** (1.0 / gamma)  # (n_r,)
-        z_2d = Z_max_r[:, np.newaxis] * self.zeta[np.newaxis, :]
-        # print('Min and Max of Z_max(r):', Z_max_r.min(), Z_max_r.max())
-        # print('Min and Max of z_2d:', z_2d.min(), z_2d.max())
-        
-        return z_2d, Z_max_r      
-    def get_image(self, keep_separate_fluxes=False, **kwargs):
-        """Optimized image computation - sequential but with optimizations."""
-        nx = kwargs.get('nx', 256)
-        ny = kwargs.get('ny', 256)
+        n_zeta = N_IMAGE_VERTICAL_GRID_POINTS
+        half = (n_zeta - 1) // 2
+        positive_zeta = np.geomspace(MINIMUM_IMAGE_SCALED_HEIGHT, 1.0, half)
+        negative_zeta = -positive_zeta[::-1]
+        self.scaled_vertical_coordinate = np.concatenate(
+            (negative_zeta, [0.0], positive_zeta))
+
+    def _build_z_grid(self, kwargs):
+        r = self.stellocentric_distances_au
+        _ = r, kwargs['r0'], kwargs['h0'], kwargs['beta'], kwargs['gamma']
+        z_max_r = self.Z0 * np.sqrt(
+            1 + (self.stellocentric_distances_au**2) / self.rmax**2)
+        z_2d = (z_max_r[:, np.newaxis]
+                * self.scaled_vertical_coordinate[np.newaxis, :])
+        return z_2d, z_max_r
+
+    def _resolve_pixel_scale(self, nx, ny, kwargs):
         if 'pixAU' not in kwargs and 'FOV_AU' not in kwargs:
-            logger.warning(f"Pixel size or FOV not provided, defaulting to FOV=0.5 AU")
-            self.pixAU = 0.5 
+            logger.warning(
+                "Pixel size or FOV not provided, defaulting to FOV=0.5 AU")
+            self.pixAU = DEFAULT_IMAGE_PIXEL_SCALE_AU
         if 'FOV_AU' in kwargs:
-            FOV_AU = kwargs['FOV_AU']
-            self.pixAU = FOV_AU / max(nx, ny)
+            self.pixAU = kwargs['FOV_AU'] / max(nx, ny)
         if 'pixAU' in kwargs:
             self.pixAU = kwargs.get('pixAU')
-        pixAU = self.pixAU
-        # Compute normalization factor once
-        thermal_flux, scattered_flux = self.flux_obj.get_fluxes(kwargs)
-        
-        sizes = self.flux_obj.sizes_for_integral
-        distances = self.distances_for_flux
-        # Z_max_norm_fctor = 20
-        # N_z_norm_fctor = 401  # must be odd to include 0
-        # z_min_norm = 1e-3
-        # half_norm = (N_z_norm_fctor - 1) // 2
-        # positive_Z_norm = np.geomspace(z_min_norm, Z_max_norm_fctor, half_norm)
-        # negative_Z_norm = -positive_Z_norm[::-1]
-        # vertical_distances = np.concatenate((negative_Z_norm, [0.0], positive_Z_norm))
-        
-        # vertical_distances = np.geomspace(0.01, 10, 200)
-        grain_density = self.grain.grain_properties['Density'] * 1000
-        
-        # norm_factor = calculate_normalization_density(
-        #     total_mass, sizes, distances, vertical_distances, grain_density,
-        #     self.density_function, kwargs, self.size_distribution_function, kwargs
-        # )
-        # self.norm_factor = norm_factor
+        return self.pixAU
 
-        if not keep_separate_fluxes:
-            images = np.zeros(shape=(self.wavelengths_for_calc.size, nx, ny))
-        else:
-            images_sca = np.zeros(shape=(self.wavelengths_for_calc.size, nx, ny))
-            images_therm = np.zeros(shape=(self.wavelengths_for_calc.size, nx, ny))
-            
-        xc = (nx-1) / 2.
-        yc = (ny-1) / 2.
+    def _pixel_grid(self, nx, ny, pixAU):
+        key = (nx, ny, float(pixAU))
+        cached = self._pixel_grid_cache.get(key)
+        if cached is not None:
+            return cached
+        xc = (nx - 1) / 2.
+        yc = (ny - 1) / 2.
         x_grid, y_grid = np.mgrid[0:nx, 0:ny]
-        x_prime = (x_grid-xc) * pixAU
-        y_prime = (y_grid-yc) * pixAU
-        
+        x_prime = (x_grid - xc) * pixAU
+        y_prime = (y_grid - yc) * pixAU
+        cached = (x_prime, y_prime)
+        self._pixel_grid_cache[key] = cached
+        return cached
+
+    def _line_sampling(self, nl):
+        cached = self._ln_cache.get(nl)
+        if cached is not None:
+            return cached
+        normalized_line_of_sight_coordinate = np.arange(nl) / (nl - 1.)
+        self._ln_cache[nl] = normalized_line_of_sight_coordinate
+        return normalized_line_of_sight_coordinate
+
+    def _prepare_geometry(self, nx, ny, pixAU, kwargs):
+        x_prime, y_prime = self._pixel_grid(nx, ny, pixAU)
+
         r0 = kwargs['r0']
         alphain = kwargs['alphain']
         alphaout = kwargs['alphaout']
@@ -108,284 +376,516 @@ class Image:
         itilt = kwargs['itilt']
         PA = kwargs['PA']
         omega = kwargs['omega']
-        
+
         p = 0.005
-        rmax = r0 * p**(1/alphaout)
+        rmax = r0 * p**(1 / alphaout)
         self.rmax = rmax
         gamma_in = alphain + beta
         gamma_out = alphaout + beta
-        r_peak = (-gamma_in/gamma_out)**(1/(2*gamma_in - 2*gamma_out)) * r0
-        z_peak = (h0*(r_peak/r0)**beta) * (np.log(1/p)**(1/gamma))
-        Z0 = z_peak/np.sqrt(r_peak**2/rmax**2 + 1)
-        self.Z0 = Z0
+        r_peak = (-gamma_in / gamma_out)**(
+            1 / (2 * gamma_in - 2 * gamma_out)) * r0
+        z_peak = (h0 * (r_peak / r0)**beta) * (
+            np.log(1 / p)**(1 / gamma))
+        self.Z0 = z_peak / np.sqrt(r_peak**2 / rmax**2 + 1)
+
         itilt_rad, omega_rad, PA_rad = np.radians([itilt, omega, PA])
         csPA, ssPA = np.cos(PA_rad), np.sin(PA_rad)
         csi, ssi = np.cos(itilt_rad), np.sin(itilt_rad)
         cso, sso = np.cos(omega_rad), np.sin(omega_rad)
-        
+
         x = csPA * x_prime + ssPA * y_prime
         y = -ssPA * x_prime + csPA * y_prime
-        
-        vD = np.array([ssi*cso, -ssi*sso, csi])
+
+        vD = np.array([ssi * cso, -ssi * sso, csi])
         rD0 = np.stack([
-            x*csi*cso + y*sso,
-            -x*csi*sso + y*cso,
-            -x*ssi
+            x * csi * cso + y * sso,
+            -x * csi * sso + y * cso,
+            -x * ssi,
         ])
-        
-        AxisC = np.array([rmax, rmax, np.sqrt(2)*Z0])
-        AxisH = np.array([rmax, rmax, Z0])
-        FARAWAY = -rmax * 10.
-        lmc, lpc = cylinder(AxisC, vD, rD0, FARAWAY, csi)
-        lmh, lph = hyperboloid_2_sheets(AxisH, vD, rD0, FARAWAY, AxisC[0], AxisC[1])
+
+        axis_c = np.array([rmax, rmax, np.sqrt(2) * self.Z0])
+        axis_h = np.array([rmax, rmax, self.Z0])
+        faraway = -rmax * 10.
+        lmc, lpc = cylinder(axis_c, vD, rD0, faraway, csi)
+        lmh, lph = hyperboloid_2_sheets(
+            axis_h, vD, rD0, faraway, axis_c[0], axis_c[1])
         lbounds = np.sort([lmc, lmh, lph, lpc], axis=0)
-        
+
         lmin = lbounds[2]
         lmax = lbounds[3]
         dl = lmax - lmin
         mask = (dl != 0)
-        # rho_proj = np.sqrt(
-        #     (rD0[0] + 0.5 * dl * vD[0])**2 +
-        #     (rD0[1] + 0.5 * dl * vD[1])**2
-        # )  # (nx, ny)
-        # # Z_max per pixel: same formula as SED
-        # Z_max_pixel = h0 * (np.maximum(rho_proj, 1e-10) / r0)**beta * (np.log(1.0 / p))**(1.0 / gamma)
-        # # Override lmin/lmax to ±Z_max(r) projected along LOS direction
-        # # Along the LOS, z = rD0[2] + l*vD[2]; at midplane z=0: l_mid = -rD0[2]/vD[2]
-        # # For itilt=0, vD[2]=1, rD0[2]=-x*ssi=0, so lmin=-Z_max, lmax=+Z_max
-        # # For general tilt, the half-length along LOS that spans ±Z_max in z:
-        # # |vD[2]| * half_l = Z_max  =>  half_l = Z_max / |vD[2]| (if vD[2] != 0)
-        # vD2_safe = np.where(np.abs(vD[2]) > 1e-10, np.abs(vD[2]), 1.0)
-        # half_l_zmax = Z_max_pixel / vD2_safe  # (nx, ny)
-        # # midpoint along original LOS
-        # l_mid = 0.5 * (lmin + lmax)
-        # # new bounds centered on midpoint, spanning ±Z_max in z
-        # lmin_new = np.where(mask, l_mid - half_l_zmax, lmin)
-        # lmax_new = np.where(mask, l_mid + half_l_zmax, lmax)
-        # dl_new   = lmax_new - lmin_new
-        # keep original mask (pixels inside cylinder)
-        # -----------------------------------------------------------
 
-        # nl = 401
-        # half_nl = (nl - 1) // 2
-        # ln_eps  = 5e-4
-        # pos_half = np.geomspace(ln_eps, 0.5, half_nl)
-        # neg_half = -pos_half[::-1]
-        # ln_sym   = np.concatenate((neg_half, [0.0], pos_half))
-        # ln       = ln_sym + 0.5                         # (nl,) in [0, 1], dense near 0.5
-        # ln       = np.clip(np.sort(ln), 0.0, 1.0)
+        nl = kwargs.get('nl', 49)
+        normalized_line_of_sight_coordinate = self._line_sampling(nl)
+        line_of_sight_path_length_au = dl[mask]
+        line_of_sight_distance_au = (
+            normalized_line_of_sight_coordinate[:, np.newaxis]
+            * line_of_sight_path_length_au[np.newaxis, :] + lmin[mask])
 
-        # l  = np.tensordot(ln, dl_new, axes=0) + lmin_new   # (nl, nx, ny)
-
-        nl = 49
-        ln = np.arange(nl)/(nl-1.)
-        l = np.tensordot(ln, dl, axes=0) + lmin
-        # print('Min and Max of l:', l.min(), l.max())
-        # print('l is: ', l)
-        xD = rD0[0][np.newaxis, :, :] + l[:, :, :] * vD[0]
-        yD = rD0[1][np.newaxis, :, :] + l[:, :, :] * vD[1]
-        zD = rD0[2][np.newaxis, :, :] + l[:, :, :] * vD[2]
-        
-        rhoD2 = xD**2 + yD**2
-        rhoD = np.sqrt(rhoD2)
-        r_mask   = distances <= rmax
-        distances_clipped = distances[r_mask]
-
-        # Build variable z grid (only over clipped radii)
-        z_2d, Z_max_r = self._build_z_grid(kwargs)
-        z_2d_clipped        = z_2d[r_mask]
-        Z_max_r_clipped     = Z_max_r[r_mask]
-        if 'M_tot' in kwargs:
-            total_mass = kwargs['M_tot'] * cst.M_earth.value
-            norm_factor = calculate_normalization_density_jacobian_sublimation(self.flux_obj.stargrain_obj,
-                total_mass, sizes, distances_clipped, z_2d_clipped, Z_max_r_clipped, self.zeta,
-                grain_density, self.density_function, kwargs,
-                self.size_distribution_function, kwargs
-            )
-        else:
-            norm_factor = kwargs['A_norm']
-        self.norm_factor = norm_factor
-
-        # print('The norm factor is:', norm_factor)
-        rho_S = np.sqrt(xD**2 + yD**2 + zD**2)
+        height_above_disk_midplane_au = (
+            rD0[2][mask][np.newaxis, :]
+            + line_of_sight_distance_au * vD[2])
+        sky_radius_squared_au2 = (
+            x_prime[mask]**2 + y_prime[mask]**2)
+        stellocentric_distance_squared_au2 = (
+            sky_radius_squared_au2[np.newaxis, :]
+            + line_of_sight_distance_au**2)
+        stellocentric_distance_au = np.sqrt(
+            stellocentric_distance_squared_au2)
+        disk_plane_cylindrical_radius_au = np.sqrt(np.maximum(
+            stellocentric_distance_squared_au2
+            - height_above_disk_midplane_au**2, 0.0))
         scattering_angle = np.pi - np.arccos(
-            np.clip(l[:, mask] / np.sqrt(x_prime[mask]**2 + y_prime[mask]**2 + l[:, mask]**2), -1, 1)
-        )
-        
-        for i, wave in enumerate(tqdm(self.wavelengths_for_calc, desc="Optimized processing", disable=True)):
-            # Create interpolators
-            thermal_interp = scipy.interpolate.interp1d(
-                self.distances_for_flux, thermal_flux[i, :],
-                kind='linear', bounds_error=False, fill_value=0
-            )
-            scattered_interp = RegularGridInterpolator(
-                (self.distances_for_flux, self.scattering_angles),
-                scattered_flux[i, :, :], fill_value=0, bounds_error=False
-            )
-            
-            rho_flat = rhoD[:, mask].ravel()
-            rhoS_flat = rho_S[:, mask].ravel()
+            np.clip(line_of_sight_distance_au
+                    / stellocentric_distance_au, -1, 1))
 
-            angle_flat = scattering_angle.ravel()
-            interp_points = np.column_stack([rhoS_flat, angle_flat])
-            
-            scattered_values = scattered_interp(interp_points)
-            scattered_emissivity = scattered_values.reshape(rhoD[:, mask].shape)
-            
-            density_vals = self.density_function(rhoD[:, mask], 0., zD[:, mask], kwargs)
-            thermal_vals = thermal_interp(rho_S[:, mask])
-            
-            if not keep_separate_fluxes:
-                limage = (scattered_emissivity + thermal_vals) * density_vals
-                image = np.zeros([nx, ny])
-                image[mask] = scipy.integrate.trapezoid(limage, x=ln, axis=0) * dl[mask] * pixAU**2
-                image = np.flip(image.T, axis=0) * norm_factor
-                images[i, :, :] = image
-            else:
-                # Scattered component
-                limage_sca = scattered_emissivity * density_vals
-                image_sca = np.zeros([nx, ny])
-                image_sca[mask] = scipy.integrate.trapezoid(limage_sca, x=ln, axis=0) * dl[mask] * pixAU**2
-                image_sca = np.flip(image_sca.T, axis=0) * norm_factor
-                images_sca[i, :, :] = image_sca
-                
-                # Thermal component
-                limage_therm = thermal_vals * density_vals
-                image_therm = np.zeros([nx, ny])
-                image_therm[mask] = scipy.integrate.trapezoid(limage_therm, x=ln, axis=0) * dl[mask] * pixAU**2
-                image_therm = np.flip(image_therm.T, axis=0) * norm_factor
-                images_therm[i, :, :] = image_therm
-            
-    
-        if keep_separate_fluxes:
-            return images_sca, images_therm
+        return {
+            'normalized_line_of_sight_coordinate': (
+                normalized_line_of_sight_coordinate),
+            'mask': mask,
+            'line_of_sight_path_length_au': line_of_sight_path_length_au,
+            'disk_plane_cylindrical_radius_au': (
+                disk_plane_cylindrical_radius_au),
+            'stellocentric_distance_au': stellocentric_distance_au,
+            'height_above_disk_midplane_au': (
+                height_above_disk_midplane_au),
+            'scattering_angle_radian': scattering_angle.ravel(),
+            'nx': nx,
+            'ny': ny,
+            'pixAU': pixAU,
+        }
+
+    def _normalization(self, sizes, kwargs):
+        if 'A_norm' in kwargs:
+            self.norm_factor = kwargs['A_norm']
+            return self.norm_factor
+
+        distances = self.stellocentric_distances_au
+        grain_density = self.grain.grain_properties['Density'] * 1000
+        r_mask = distances <= self.rmax
+        distances_clipped = distances[r_mask]
+        z_2d, z_max_r = self._build_z_grid(kwargs)
+        z_2d_clipped = z_2d[r_mask]
+        z_max_r_clipped = z_max_r[r_mask]
+
+        total_mass = kwargs['M_tot'] * cst.M_earth.value
+        norm_factor = calculate_normalization_density_jacobian_sublimation(
+            self.radiative_transfer.temperature_model,
+            total_mass, sizes, distances_clipped, z_2d_clipped,
+            z_max_r_clipped, self.scaled_vertical_coordinate, grain_density,
+            self.density_function, kwargs,
+            self.size_distribution_function, kwargs)
+        self.norm_factor = norm_factor
+        return norm_factor
+
+    def prepare_spatial_disk(self, **kwargs):
+        """Calculate wavelength-independent geometry and density once.
+
+        Multi-composition fitters can pass the returned dictionary to
+        ``get_image(prepared_spatial_disk=...)`` for every composition that
+        belongs to the same ring. The arrays are read-only during imaging.
+        """
+        nx = kwargs.get('nx', 256)
+        ny = kwargs.get('ny', 256)
+        pixAU = self._resolve_pixel_scale(nx, ny, kwargs)
+        geometry = self._prepare_geometry(nx, ny, pixAU, kwargs)
+        disk_radius = geometry['disk_plane_cylindrical_radius_au']
+        disk_height = geometry['height_above_disk_midplane_au']
+        use_numba_density = (
+            _NUMBA_IMAGE_AVAILABLE
+            and getattr(self.density_function, '__name__', '')
+            == 'two_power_law')
+        if use_numba_density:
+            density = two_power_law_numba(
+                np.ascontiguousarray(disk_radius),
+                np.ascontiguousarray(disk_height),
+                kwargs['r0'], kwargs['h0'], kwargs['alphain'],
+                kwargs['alphaout'], kwargs['beta'], kwargs['gamma'])
         else:
+            density = self.density_function(
+                disk_radius, 0.0, disk_height, kwargs)
+        return {
+            'geometry': geometry,
+            'density': density,
+            'rmax': self.rmax,
+            'Z0': self.Z0,
+            'nx': nx,
+            'ny': ny,
+            'pixAU': pixAU,
+        }
+
+    @staticmethod
+    def _uniform_grid_indices_and_interpolation_fractions(grid, values):
+        flat = np.asarray(values).ravel()
+        oob = (flat < grid[0]) | (flat > grid[-1])
+        scaled = (flat - grid[0]) / (grid[1] - grid[0])
+        idx = np.floor(scaled).astype(np.int64)
+        idx = np.clip(idx, 0, len(grid) - 2)
+        t = scaled - idx
+        t = np.where(flat == grid[-1], 1.0, t)
+        return idx, t.astype(np.float64), oob
+
+    @staticmethod
+    def _geometric_grid_indices_and_interpolation_fractions(grid, values):
+        flat = np.asarray(values).ravel()
+        oob = (flat < grid[0]) | (flat > grid[-1])
+        safe = np.maximum(flat, grid[0])
+        log_step = np.log(grid[1] / grid[0])
+        idx = np.floor(np.log(safe / grid[0]) / log_step).astype(np.int64)
+        idx = np.clip(idx, 0, len(grid) - 2)
+        t = (flat - grid[idx]) / (grid[idx + 1] - grid[idx])
+        return idx, t.astype(np.float64), oob
+
+    def get_image(self, keep_separate_fluxes=False,
+                  prepared_spatial_disk=None, **kwargs):
+        t_total0 = time.perf_counter()
+        nx = kwargs.get('nx', 256)
+        ny = kwargs.get('ny', 256)
+        pixAU = self._resolve_pixel_scale(nx, ny, kwargs)
+
+        use_numba_integrator = _NUMBA_IMAGE_AVAILABLE
+        # The Numba path keeps radial illumination and angular scattering
+        # separate, avoiding a much larger wavelength-distance-angle cube.
+
+        t0 = time.perf_counter()
+        if use_numba_integrator:
+            (dust_thermal_emission_by_distance,
+             scattered_starlight_before_angular_dependence,
+             scattering_phase_function_by_angle) = (
+                self.radiative_transfer.calculate_emission_for_image(kwargs))
+        else:
+            (dust_thermal_emission_by_distance,
+             scattered_starlight_before_angular_dependence,
+             scattering_phase_function_by_angle) = (
+                self.radiative_transfer.calculate_emission_for_image(kwargs))
+            scattered_starlight_by_distance_and_angle = (
+                scattered_starlight_before_angular_dependence[:, :, None]
+                * scattering_phase_function_by_angle[None, None, :])
+        sizes = self.radiative_transfer.sizes_for_integral
+        t_flux = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        if prepared_spatial_disk is None:
+            spatial_disk = self.prepare_spatial_disk(**kwargs)
+        else:
+            spatial_disk = prepared_spatial_disk
+            expected = (nx, ny, float(pixAU))
+            supplied = (
+                spatial_disk['nx'], spatial_disk['ny'],
+                float(spatial_disk['pixAU']))
+            if supplied != expected:
+                raise ValueError(
+                    'Prepared disk image dimensions or pixel scale differ '
+                    'from the requested image settings.')
+        geom = spatial_disk['geometry']
+        density_vals = spatial_disk['density']
+        self.rmax = spatial_disk['rmax']
+        self.Z0 = spatial_disk['Z0']
+        t_geom = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        norm_factor = self._normalization(sizes, kwargs)
+        t_norm = time.perf_counter() - t0
+
+        stellocentric_distance_au = geom['stellocentric_distance_au']
+        t_invariant = 0.0
+
+        n_waves = self.wavelengths_for_calc.size
+        normalized_line_of_sight_coordinate = (
+            geom['normalized_line_of_sight_coordinate'])
+        mask = geom['mask']
+        line_of_sight_path_length_au = (
+            geom['line_of_sight_path_length_au'])
+        pixel_area = pixAU**2
+
+        t0 = time.perf_counter()
+        if use_numba_integrator:
+            distance_grid_interpolator = (
+                self._geometric_grid_indices_and_interpolation_fractions)
+            (stellocentric_distance_grid_index,
+             stellocentric_distance_interpolation_fraction,
+             outside_stellocentric_distance_grid) = distance_grid_interpolator(
+                self.stellocentric_distances_au, stellocentric_distance_au)
+            scattering_angle_grid_interpolator = (
+                self._uniform_grid_indices_and_interpolation_fractions)
+            (scattering_angle_grid_index,
+             scattering_angle_interpolation_fraction,
+             outside_scattering_angle_grid) = (
+                scattering_angle_grid_interpolator(
+                self.scattering_angles_radian,
+                geom['scattering_angle_radian']))
+
+            if not keep_separate_fluxes:
+                pixel_major = density_vals.size >= PIXEL_MAJOR_DENSITY_THRESHOLD
+                if pixel_major:
+                    n_l, n_pix = density_vals.shape
+                    shape_pm = (n_pix, n_l)
+                    image_values = _integrate_total_pixel_major_numba(
+                        np.ascontiguousarray(
+                            dust_thermal_emission_by_distance),
+                        np.ascontiguousarray(
+                            scattered_starlight_before_angular_dependence),
+                        np.ascontiguousarray(
+                            scattering_phase_function_by_angle),
+                        np.ascontiguousarray(density_vals.T),
+                        np.ascontiguousarray(
+                            stellocentric_distance_grid_index.reshape(
+                                n_l, n_pix).T),
+                        np.ascontiguousarray(
+                            stellocentric_distance_interpolation_fraction.reshape(
+                                n_l, n_pix).T),
+                        np.ascontiguousarray(
+                            outside_stellocentric_distance_grid.reshape(
+                                shape_pm[::-1]).T),
+                        np.ascontiguousarray(
+                            scattering_angle_grid_index.reshape(n_l, n_pix).T),
+                        np.ascontiguousarray(
+                            scattering_angle_interpolation_fraction.reshape(
+                                n_l, n_pix).T),
+                        np.ascontiguousarray(
+                            outside_scattering_angle_grid.reshape(
+                                shape_pm[::-1]).T),
+                        line_of_sight_path_length_au, pixel_area, norm_factor)
+                else:
+                    image_values = _integrate_total_numba(
+                        np.ascontiguousarray(
+                            dust_thermal_emission_by_distance),
+                        np.ascontiguousarray(
+                            scattered_starlight_before_angular_dependence),
+                        np.ascontiguousarray(
+                            scattering_phase_function_by_angle),
+                        np.ascontiguousarray(density_vals),
+                        stellocentric_distance_grid_index,
+                        stellocentric_distance_interpolation_fraction,
+                        outside_stellocentric_distance_grid,
+                        scattering_angle_grid_index,
+                        scattering_angle_interpolation_fraction,
+                        outside_scattering_angle_grid,
+                        line_of_sight_path_length_au, pixel_area, norm_factor)
+                images = _place_line_of_sight_values_on_sky(
+                    image_values, mask, nx, ny)
+            else:
+                pixel_major = density_vals.size >= PIXEL_MAJOR_DENSITY_THRESHOLD
+                if pixel_major:
+                    n_l, n_pix = density_vals.shape
+                    image_sca_values, image_therm_values = (
+                        _integrate_separate_pixel_major_numba(
+                            np.ascontiguousarray(
+                                dust_thermal_emission_by_distance),
+                            np.ascontiguousarray(
+                                scattered_starlight_before_angular_dependence),
+                            np.ascontiguousarray(
+                                scattering_phase_function_by_angle),
+                            np.ascontiguousarray(density_vals.T),
+                            np.ascontiguousarray(
+                                stellocentric_distance_grid_index.reshape(
+                                    n_l, n_pix).T),
+                            np.ascontiguousarray(
+                                stellocentric_distance_interpolation_fraction
+                                .reshape(n_l, n_pix).T),
+                            np.ascontiguousarray(
+                                outside_stellocentric_distance_grid.reshape(
+                                    n_l, n_pix).T),
+                            np.ascontiguousarray(
+                                scattering_angle_grid_index.reshape(
+                                    n_l, n_pix).T),
+                            np.ascontiguousarray(
+                                scattering_angle_interpolation_fraction.reshape(
+                                    n_l, n_pix).T),
+                            np.ascontiguousarray(
+                                outside_scattering_angle_grid.reshape(
+                                    n_l, n_pix).T),
+                            line_of_sight_path_length_au,
+                            pixel_area, norm_factor))
+                else:
+                    image_sca_values, image_therm_values = (
+                        _integrate_separate_numba(
+                            np.ascontiguousarray(
+                                dust_thermal_emission_by_distance),
+                            np.ascontiguousarray(
+                                scattered_starlight_before_angular_dependence),
+                            np.ascontiguousarray(
+                                scattering_phase_function_by_angle),
+                            np.ascontiguousarray(density_vals),
+                            stellocentric_distance_grid_index,
+                            stellocentric_distance_interpolation_fraction,
+                            outside_stellocentric_distance_grid,
+                            scattering_angle_grid_index,
+                            scattering_angle_interpolation_fraction,
+                            outside_scattering_angle_grid,
+                            line_of_sight_path_length_au,
+                            pixel_area, norm_factor))
+                images_sca = _place_line_of_sight_values_on_sky(
+                    image_sca_values, mask, nx, ny)
+                images_therm = _place_line_of_sight_values_on_sky(
+                    image_therm_values, mask, nx, ny)
+
+            t_loop = time.perf_counter() - t0
+            self.timings = {
+                'radiative_transfer': t_flux,
+                'geometry': t_geom,
+                'normalisation': t_norm,
+                'dust_density': t_invariant,
+                'line_of_sight_integration': t_loop,
+                'total': time.perf_counter() - t_total0,
+                'n_masked_px': int(mask.sum()),
+                'n_pixels_total': nx * ny,
+            }
+            if keep_separate_fluxes:
+                return images_sca, images_therm
             return images
 
-if __name__ == "__main__":
-    from pyGrater.stargrains import Grain, Star
-    from pyGrater.density import two_power_law
-    from pyGrater.size_distributions import power_law_distribution
-    from pyGrater.phase_functions import HenveyGreenstein
-    
-    nx, ny = 256, 256  
-    # pixAU = 0.003
-    wavelengths_for_calc = np.array([1.0, 3.0])
-    grain = Grain(redo_Q=False)
-    star = Star(star_name = 'bPic')
-    
-    img_obj = Image(grain, star, two_power_law, power_law_distribution, 
-                           HenveyGreenstein, wavelengths_for_calc)
-    
-    test_params = {
-        'r0': 0.09, 'h0': 0.009, 'alphain': 10., 'alphaout': -6, 
-        'gamma': 2., 'beta': 2, 'itilt': 45., 'PA': 90., 'omega': 45.,
-        'a_min': 0.01e-6, 'a_max': 1000e-6, 'kappa': 6, 
-        'N_sizes_integral': 200, 'g': 0.5, 'M_tot': 2.5e-10, 'FOV_AU': 0.5, 'nx': nx, 'ny': ny
-    }
-    
-    start_time = time.time()
-    images_sca, images_therm = img_obj.get_image(keep_separate_fluxes=True, **test_params)
-    elapsed = time.time() - start_time
-    
-    print(f"Images calculated in {elapsed:.2f} seconds")
-    print(f"Image shapes: {images_sca.shape}, {images_therm.shape}")
-    
-    #%%
-    # Plot all wavelengths with scattered, thermal, and total components
-    n_wavelengths = len(wavelengths_for_calc)
-    n_cols = 3  
-    n_rows = n_wavelengths
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6*n_rows))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)  
-    
-    images_total = images_sca + images_therm
-    
-    for i, wave in enumerate(wavelengths_for_calc):
-        print('The total thermal flux at', wave, 'µm is:', np.sum(images_therm[i,:,:]))
-        print('The total scattered flux at', wave, 'µm is:', np.sum(images_sca[i,:,:]))
-        row = i
-        
-        # Scattered light
-        im1 = axes[row, 0].imshow(images_sca[i,:,:], cmap='inferno')
-        axes[row, 0].set_title(f'{wave:.2f} µm - Scattered Light', fontsize=16, pad=20)
-        
-        # Thermal emission  
-        im2 = axes[row, 1].imshow(images_therm[i,:,:], cmap='inferno')
-        axes[row, 1].set_title(f'{wave:.2f} µm - Thermal Emission', fontsize=16, pad=20)
-        
-        # Total flux
-        im3 = axes[row, 2].imshow(images_total[i,:,:], cmap='inferno')
-        axes[row, 2].set_title(f'{wave:.2f} µm - Total Flux', fontsize=16, pad=20)
-        
-        for col, im in enumerate([im1, im2, im3]):
-            xticks = np.linspace(0, images_sca.shape[2]-1, 5)
-            yticks = np.linspace(0, images_sca.shape[1]-1, 5)
-            x_labels = (xticks - images_sca.shape[2]//2) * pixAU
-            y_labels = (yticks - images_sca.shape[1]//2) * pixAU
-            
-            axes[row, col].set_xticks(xticks)
-            axes[row, col].set_yticks(yticks)
-            axes[row, col].set_xticklabels([f'{x:.2f}' for x in x_labels], fontsize=14)
-            axes[row, col].set_yticklabels([f'{y:.1f}' for y in y_labels], fontsize=14)
-            axes[row, col].set_xlabel('X (AU)', fontsize=16)
-            axes[row, col].set_ylabel('Y (AU)', fontsize=16)
-            
-            cbar = plt.colorbar(im, ax=axes[row, col], shrink=0.8)
-            cbar.ax.tick_params(labelsize=13)
-            # cbar.set_label('Intensity', fontsize=16)
-    
-    plt.tight_layout()
-    # plt.savefig("all_wavelengths_components.png", dpi=300)
-    plt.show()
-    
+        if not keep_separate_fluxes:
+            images = np.zeros(shape=(n_waves, ny, nx))
+        else:
+            images_sca = np.zeros(shape=(n_waves, ny, nx))
+            images_therm = np.zeros(shape=(n_waves, ny, nx))
 
-    #%%
-    # Plot single wavelength 
-    target_wavelength = 0.75  # Specify desired wavelength in microns
-    
-    wavelength_diff = np.abs(wavelengths_for_calc - target_wavelength)
-    closest_idx = np.argmin(wavelength_diff)
-    closest_wavelength = wavelengths_for_calc[closest_idx]
-    
-    print(f"Target wavelength: {target_wavelength:.3f} µm")
-    print(f"Closest available wavelength: {closest_wavelength:.3f} µm")
-    
-    image_total_single = images_sca[closest_idx] + images_therm[closest_idx]
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Scattered light
-    im1 = axes[0].imshow(images_sca[closest_idx,:,:], cmap='inferno')
-    axes[0].set_title(f'{closest_wavelength:.3f} µm - Scattered Light', fontsize=18, pad=20)
-    
-    # Thermal emission
-    im2 = axes[1].imshow(images_therm[closest_idx,:,:], cmap='inferno')
-    axes[1].set_title(f'{closest_wavelength:.3f} µm - Thermal Emission', fontsize=18, pad=20)
-    
-    # Total flux
-    im3 = axes[2].imshow(image_total_single, cmap='inferno')
-    axes[2].set_title(f'{closest_wavelength:.3f} µm - Total Flux', fontsize=18, pad=20)
-    
-    for col, im in enumerate([im1, im2, im3]):
-        xticks = np.linspace(0, images_sca.shape[2]-1, 5)
-        yticks = np.linspace(0, images_sca.shape[1]-1, 5)
-        x_labels = (xticks - images_sca.shape[2]//2) * pixAU
-        y_labels = (yticks - images_sca.shape[1]//2) * pixAU
-        
-        axes[col].set_xticks(xticks)
-        axes[col].set_yticks(yticks)
-        axes[col].set_xticklabels([f'{x:.1f}' for x in x_labels], fontsize=16)
-        axes[col].set_yticklabels([f'{y:.1f}' for y in y_labels], fontsize=16)
-        axes[col].set_xlabel('X (AU)', fontsize=18)
-        axes[col].set_ylabel('Y (AU)', fontsize=18)
-        
-        cbar = plt.colorbar(im, ax=axes[col], shrink=0.8)
-        cbar.ax.tick_params(labelsize=16)
-        cbar.set_label('Intensity', fontsize=18)
-    
-    plt.tight_layout()
-    plt.show()
-# %%
+        scalar_loop = n_waves < 4
+        stellocentric_distance_flat_au = stellocentric_distance_au.ravel()
+        interp_points = np.column_stack(
+            [stellocentric_distance_flat_au,
+             geom['scattering_angle_radian']])
+        chunk = None
+        if scalar_loop:
+            chunk = 1
+        if chunk is None:
+            n_points = max(1, stellocentric_distance_flat_au.size)
+            target_values = 4_000_000
+            chunk = max(1, min(n_waves, target_values // n_points))
+
+        for i0 in tqdm(range(0, n_waves, chunk),
+                       desc="Optimized image optimized processing", disable=True):
+            i1 = min(i0 + chunk, n_waves)
+            if scalar_loop:
+                dust_thermal_emission_interpolator = scipy.interpolate.interp1d(
+                    self.stellocentric_distances_au,
+                    dust_thermal_emission_by_distance[i0, :],
+                    kind='linear', bounds_error=False, fill_value=0)
+                scattered_starlight_interpolator = RegularGridInterpolator(
+                    (self.stellocentric_distances_au,
+                     self.scattering_angles_radian),
+                    scattered_starlight_by_distance_and_angle[i0, :, :],
+                    fill_value=0,
+                    bounds_error=False)
+
+                scattered_starlight_along_lines_of_sight = (
+                    scattered_starlight_interpolator(interp_points).reshape(
+                        disk_plane_cylindrical_radius_au.shape))
+                dust_thermal_emission_along_lines_of_sight = (
+                    dust_thermal_emission_interpolator(
+                        stellocentric_distance_au))
+
+                if not keep_separate_fluxes:
+                    limage = (
+                        scattered_starlight_along_lines_of_sight
+                        + dust_thermal_emission_along_lines_of_sight
+                    ) * density_vals
+                    image = np.zeros([nx, ny])
+                    image[mask] = (
+                        scipy.integrate.trapezoid(
+                            limage,
+                            x=normalized_line_of_sight_coordinate, axis=0)
+                        * line_of_sight_path_length_au * pixel_area)
+                    images[i0, :, :] = (
+                        np.flip(image.T, axis=0) * norm_factor)
+                else:
+                    limage_sca = (
+                        scattered_starlight_along_lines_of_sight * density_vals)
+                    image_sca = np.zeros([nx, ny])
+                    image_sca[mask] = (
+                        scipy.integrate.trapezoid(
+                            limage_sca,
+                            x=normalized_line_of_sight_coordinate, axis=0)
+                        * line_of_sight_path_length_au * pixel_area)
+                    images_sca[i0, :, :] = (
+                        np.flip(image_sca.T, axis=0) * norm_factor)
+
+                    limage_therm = (
+                        dust_thermal_emission_along_lines_of_sight
+                        * density_vals)
+                    image_therm = np.zeros([nx, ny])
+                    image_therm[mask] = (
+                        scipy.integrate.trapezoid(
+                            limage_therm,
+                            x=normalized_line_of_sight_coordinate, axis=0)
+                        * line_of_sight_path_length_au * pixel_area)
+                    images_therm[i0, :, :] = (
+                        np.flip(image_therm.T, axis=0) * norm_factor)
+                continue
+
+            dust_thermal_emission_interpolator = scipy.interpolate.interp1d(
+                self.stellocentric_distances_au,
+                dust_thermal_emission_by_distance[i0:i1, :],
+                axis=1, kind='linear', bounds_error=False, fill_value=0)
+            scattered_starlight_interpolator = RegularGridInterpolator(
+                (self.stellocentric_distances_au,
+                 self.scattering_angles_radian),
+                np.moveaxis(
+                    scattered_starlight_by_distance_and_angle[i0:i1, :, :],
+                    0, -1),
+                fill_value=0, bounds_error=False)
+
+            scattered_starlight_along_lines_of_sight = np.moveaxis(
+                scattered_starlight_interpolator(interp_points), -1, 0).reshape(
+                    i1 - i0, *disk_plane_cylindrical_radius_au.shape)
+            dust_thermal_emission_along_lines_of_sight = (
+                dust_thermal_emission_interpolator(stellocentric_distance_au))
+
+            if not keep_separate_fluxes:
+                limage = ((scattered_starlight_along_lines_of_sight
+                           + dust_thermal_emission_along_lines_of_sight)
+                          * density_vals[np.newaxis, :, :])
+                image_values = (
+                    scipy.integrate.trapezoid(
+                        limage, x=normalized_line_of_sight_coordinate, axis=1)
+                    * line_of_sight_path_length_au[np.newaxis, :] * pixel_area)
+                for j, values in enumerate(image_values, start=i0):
+                    image = np.zeros([nx, ny])
+                    image[mask] = values
+                    images[j, :, :] = np.flip(image.T, axis=0) * norm_factor
+            else:
+                limage_sca = (
+                    scattered_starlight_along_lines_of_sight
+                    * density_vals[np.newaxis, :, :])
+                limage_therm = (
+                    dust_thermal_emission_along_lines_of_sight
+                    * density_vals[np.newaxis, :, :])
+                image_sca_values = (
+                    scipy.integrate.trapezoid(
+                        limage_sca,
+                        x=normalized_line_of_sight_coordinate, axis=1)
+                    * line_of_sight_path_length_au[np.newaxis, :] * pixel_area)
+                image_therm_values = (
+                    scipy.integrate.trapezoid(
+                        limage_therm,
+                        x=normalized_line_of_sight_coordinate, axis=1)
+                    * line_of_sight_path_length_au[np.newaxis, :] * pixel_area)
+                for j, (sca_values, therm_values) in enumerate(
+                        zip(image_sca_values, image_therm_values), start=i0):
+                    image_sca = np.zeros([nx, ny])
+                    image_sca[mask] = sca_values
+                    images_sca[j, :, :] = (
+                        np.flip(image_sca.T, axis=0) * norm_factor)
+
+                    image_therm = np.zeros([nx, ny])
+                    image_therm[mask] = therm_values
+                    images_therm[j, :, :] = (
+                        np.flip(image_therm.T, axis=0) * norm_factor)
+
+        t_loop = time.perf_counter() - t0
+        self.timings = {
+            'radiative_transfer': t_flux,
+            'geometry': t_geom,
+            'normalisation': t_norm,
+            'dust_density': t_invariant,
+            'line_of_sight_integration': t_loop,
+            'total': time.perf_counter() - t_total0,
+            'n_masked_px': int(mask.sum()),
+            'n_pixels_total': nx * ny,
+        }
+
+        if keep_separate_fluxes:
+            return images_sca, images_therm
+        return images

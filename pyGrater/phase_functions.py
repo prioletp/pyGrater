@@ -1,17 +1,27 @@
-#%%
+"""Normalized dust-scattering phase functions."""
+
 import numpy as np
 
-def isotropic(phi, **kwargs):
-    return np.ones(phi.shape)/ (4.0 * np.pi)
+
+def isotropic(scattering_angle_radian, **parameters):
+    """Return equal scattered intensity per unit solid angle."""
+    del parameters
+    return np.ones(scattering_angle_radian.shape) / (4.0 * np.pi)
 
 
-def HenveyGreenstein(phi, **kwargs):
-    """Returns a Henyey-Greenstein phase function with coefficient g."""
-    """Input: phi in radians"""
-    g = kwargs['g']
-    cos_phi = np.cos(phi)
-    return 1./(4*np.pi)*(1-g**2) / \
-    (1+g**2-2*g*cos_phi)**(3./2.)
+def HenveyGreenstein(scattering_angle_radian, **parameters):
+    """Return the normalized Henyey-Greenstein phase function.
+
+    ``g=0`` is isotropic and positive ``g`` produces forward scattering.
+    The historical public function name is retained even though "Henyey" is
+    misspelled in it.
+    """
+    asymmetry_parameter = parameters['g']
+    cosine_scattering_angle = np.cos(scattering_angle_radian)
+    return (
+        (1.0 - asymmetry_parameter**2) / (4.0 * np.pi)
+        / (1.0 + asymmetry_parameter**2
+           - 2.0 * asymmetry_parameter * cosine_scattering_angle)**1.5)
 
 #%%
 if __name__=='__main__':   

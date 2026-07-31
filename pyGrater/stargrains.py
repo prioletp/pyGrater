@@ -1,3 +1,4 @@
+import logging
 #%%
 
 # from pyGrater import grain_temperatures
@@ -18,6 +19,9 @@ from pprint import pformat  # already imported
 
 from astropy.io import fits
 
+
+from pyGrater.config.logging_config import log_banner, log_info
+logger = logging.getLogger(__name__)
 class Grain:
     def __init__(self, **kwargs):
         """
@@ -71,14 +75,12 @@ class Grain:
         redo_Q = kwargs.get('redo_Q', False)
         composition = kwargs.get('composition', None)
         if composition is None:
-            print(f"No composition specified, PROBLEM'")
+            log_info(logger, f"No composition specified, PROBLEM'")
         
         
-        print("="*60)
-        print("CREATING GRAIN OBJECT")
-        print("="*60)
+        log_banner(logger, "CREATING GRAIN OBJECT", width=60)
         self.developper_params_path =  Path(__file__).parent / 'parameters' / "developper_params.yaml"
-        print(f'Developper parameters file: {self.developper_params_path}')  # updated
+        log_info(logger, f'Developper parameters file: {self.developper_params_path}')  # updated
         with open(self.developper_params_path, 'r') as dev_params_yaml_file:
             self.dev_params = yaml.load(dev_params_yaml_file, Loader=yaml.FullLoader)
             
@@ -90,7 +92,7 @@ class Grain:
         self.grain_efficiencies_path = data_path / 'efficiencies'
 
         self.grain_composition_name = composition
-        print(f'Grain composition: {self.grain_composition_name}') 
+        log_info(logger, f'Grain composition: {self.grain_composition_name}') 
 
         self.grain_properties_path = data_path / 'material_list.txt'     
         self.grain_properties = utl.import_material_properties(self.grain_properties_path)[self.grain_composition_name]
@@ -99,13 +101,13 @@ class Grain:
         self.redo_Q = redo_Q
         self.set_properties(redo_Q)
 
-    def _pretty_print(self, title, obj):  # added
+    def _pretty_log_info(logger, self, title, obj):  # added
         """Pretty print helper for dictionaries and generic objects."""
-        print(title)
+        log_info(logger, title)
         if isinstance(obj, dict):
-            print(pformat(obj, sort_dicts=True, indent=2, width=100))
+            log_info(logger, pformat(obj, sort_dicts=True, indent=2, width=100))
         else:
-            print(obj)
+            log_info(logger, obj)
 
     def set_properties(self, redo_Q=False):
         Q_dic = self.get_Q(redo_Q=redo_Q, talk=True)
@@ -323,22 +325,25 @@ class Star:
             self.star_properties_path = data_path / 'star_data' / "stars_main_properties.txt"
             self.star_properties = self.load_star_properties()
         else:
+            self.star_name = kwargs.get('name', 'custom star')
+            self.star_properties_path = None
             self.star_properties = self.load_star_properties_from_kwargs(**kwargs)
             
         if self.talk:
-            print("="*60)
-            print("CREATING STAR OBJECT")
-            print("="*60)
-            print(f"Star properties file: {self.star_properties_path}")  # prettier path print
-            print(f"Star name: '{self.star_name}'")
-            print('The temperature is {:.1f} K'.format(self.temp))
-            print('The logg is {:.2f} cgs'.format(self.logg))
-            print('The radius is {:.2f} R_sun'.format(self.radius))
-            print('The distance is {:.2f} pc'.format(self.distance))
-            print('The spectral type is {}'.format(self.spectral_type))
-            print('The normalization band is {}'.format(self.normband))
-            print('The apparent magnitude in {} band is {:.2f} mag'.format(self.normband, self.apmag))
-            print(f'The stellar spectrum is binned by a factor of {bin_ratio}')
+            log_banner(logger, "CREATING STAR OBJECT", width=60)
+            if self.star_properties_path is not None:
+                log_info(logger, f"Star properties file: {self.star_properties_path}")
+            else:
+                log_info(logger, "Star properties: supplied directly")
+            log_info(logger, f"Star name: '{self.star_name}'")
+            log_info(logger, 'The temperature is {:.1f} K'.format(self.temp))
+            log_info(logger, 'The logg is {:.2f} cgs'.format(self.logg))
+            log_info(logger, 'The radius is {:.2f} R_sun'.format(self.radius))
+            log_info(logger, 'The distance is {:.2f} pc'.format(self.distance))
+            log_info(logger, 'The spectral type is {}'.format(self.spectral_type))
+            log_info(logger, 'The normalization band is {}'.format(self.normband))
+            log_info(logger, 'The apparent magnitude in {} band is {:.2f} mag'.format(self.normband, self.apmag))
+            log_info(logger, f'The stellar spectrum is binned by a factor of {bin_ratio}')
 
         # self.get_spectra(N_waves, waves=None, min_wave=None, max_wave=None, norm=True)
 
@@ -371,8 +376,14 @@ class Star:
         
         index_for_star = np.where(col_dict['star'] == self.star_name)[0]
         if index_for_star.size == 0:
-            print(f"Star '{self.star_name}' not found in {self.star_properties_path}")
-            raise ValueError(f"Unknown star: {self.star_name}")
+            available_stars = sorted(str(name) for name in col_dict['star'])
+            available = ', '.join(available_stars)
+            message = (
+                f"Unknown star: {self.star_name}. "
+                f"Available stars in {self.star_properties_path}: "
+                f"{available}")
+            log_info(logger, message)
+            raise ValueError(message)
         # print(f"Index for star '{self.star_name}': {int(index_for_star[0])}")  # cleaner index print
         
         star_properties_dic = {}
@@ -423,21 +434,21 @@ class Star:
                         skiprows=1, usecols=(0,1))
         specTemp = spec[abs(self.temp-spec[:,0])==
                         np.min(abs(self.temp-spec[:,0]))]
-        print('Closest temperatures in the grid:', specTemp)
+        log_info(logger, 'Closest temperatures in the grid:', specTemp)
         specFin = specTemp[abs(self.logg-specTemp[:,1])==
                         np.min(abs(self.logg-specTemp[:,1]))]
-        print('Closest log(g) in the grid:', specFin)
+        log_info(logger, 'Closest log(g) in the grid:', specFin)
         if abs(self.temp-specFin[0][0]) > 100 :
-            print('NB : Stellar temperature is too far')
+            log_info(logger, 'NB : Stellar temperature is too far')
         if abs(self.logg-specFin[0][1]) > 0.5 :
-            print('NB : log(g) is not good')          
+            log_info(logger, 'NB : log(g) is not good')          
         filename = ( path_spectrum_data + '/'
                     '{:.0f}_{:.1f}.txt'.format(specFin[0][0],specFin[0][1]) )
         
         spectra = np.loadtxt(filename, skiprows=2)
         
         lam = spectra[:,0]
-        print('The number of wavelengths in the original spectrum is:', lam.size)
+        log_info(logger, 'The number of wavelengths in the original spectrum is:', lam.size)
         N_waves = lam.size
         Fnu = spectra[:,1]  
          
@@ -447,9 +458,9 @@ class Star:
         Fnu = Fnu[idx2]
 
         if norm :
-            print()
+            log_info(logger, )
             fluxV, V0pt = utl.flux_in_band(band, lam, Fnu)
-            print('AQUI', V0pt, fluxV)
+            log_info(logger, 'AQUI', V0pt, fluxV)
             Fnu = Fnu/fluxV * 10.**(-Normmag/2.5) * V0pt # Flux seen from earth
         else :
             Fnu = Fnu*(self.radius/(self.distance*cst.pc))**2
@@ -467,12 +478,12 @@ class Star:
         self.lum_full_range = Lstar
         # print(f"Stellar luminosity: {self.lum:.2f} L_sun")
         if norm :
-            print(f'Stellar spectrum loaded from {self.waves_full_range[0]} to {self.waves_full_range[-1]} µm and normalized.')
-            print(f"Normalized in {band}-band to {Normmag} mag")
-            print(f"The stellar luminosity is {self.lum:.2f} L_sun")
+            log_info(logger, f'Stellar spectrum loaded from {self.waves_full_range[0]} to {self.waves_full_range[-1]} µm and normalized.')
+            log_info(logger, f"Normalized in {band}-band to {Normmag} mag")
+            log_info(logger, f"The stellar luminosity is {self.lum:.2f} L_sun")
         else:
-            print(f'Stellar spectrum loaded from {self.waves[0]} to {self.waves[-1]} µm and not normalized.')   
-            print(f"The stellar luminosity is {self.lum:.2f} L_sun")
+            log_info(logger, f'Stellar spectrum loaded from {self.waves[0]} to {self.waves[-1]} µm and not normalized.')   
+            log_info(logger, f"The stellar luminosity is {self.lum:.2f} L_sun")
         return None
 
     def get_spectra(self, bin_ratio=20, norm=True): #,band,Normmag,waveRef,norm=True) :
@@ -490,12 +501,12 @@ class Star:
         specFin = specTemp[abs(self.logg-specTemp[:,1])==
                         np.min(abs(self.logg-specTemp[:,1]))]
         if self.talk:
-            print('The closest spectrum in the grid has T_eff = {:.1f} K and log(g) = {:.1f} cgs'.format(specFin[0][0], specFin[0][1]))
+            log_info(logger, 'The closest spectrum in the grid has T_eff = {:.1f} K and log(g) = {:.1f} cgs'.format(specFin[0][0], specFin[0][1]))
 
         if abs(self.temp-specFin[0][0]) > 100 :
-            print('NB : Stellar temperature is too far')
+            log_info(logger, 'NB : Stellar temperature is too far')
         if abs(self.logg-specFin[0][1]) > 0.5 :
-            print('NB : log(g) is not good')          
+            log_info(logger, 'NB : log(g) is not good')          
         filename = ( path_spectrum_data + '/'
                     '{:.0f}_{:.1f}.txt'.format(specFin[0][0],specFin[0][1]) )
         
@@ -533,9 +544,9 @@ class Star:
         self.lum = Lstar
         if self.talk:
             if norm :
-                    print(f'Stellar spectrum loaded and normalized.')
+                    log_info(logger, f'Stellar spectrum loaded and normalized.')
             else:
-                    print(f'Stellar spectrum loaded and not normalized.')   
+                    log_info(logger, f'Stellar spectrum loaded and not normalized.')   
         return None
     
     def get_flux_in_band(self, band):
