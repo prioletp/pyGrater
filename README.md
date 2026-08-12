@@ -106,36 +106,6 @@ interferometric workflows.
 
 ---
 
-## Performance
-
-The public `SED`, `Image`, and `Fluxes` classes are the fastest validated
-implementations developed for repeated fitting. The first call includes Numba
-compilation; the values below describe warmed repeated evaluations.
-
-### SED timing
-
-The SED was benchmarked using HD113766 and `c_olivine_Fe_Poor`.
-
-| Wavelengths | Previous | Current | Additional speedup |
-|---:|---:|---:|---:|
-| 4 | 0.169 s | 0.127 s | 1.34x |
-| 16 | 0.159 s | 0.080 s | 1.99x |
-| 64 | 0.156 s | 0.136 s | 1.15x |
-| 128 | 0.167 s | 0.151 s | 1.11x |
-| 256 | 0.246 s | 0.206 s | 1.20x |
-| 500 | 0.418 s | 0.372 s | 1.12x |
-
-These are representative median warmed timings on the development machine;
-absolute times depend on CPU, thread count, and wavelength/parameter choices.
-The 500-wavelength row used 10 repeated parameter draws to reduce timing
-noise.
-
-The implementation automatically selects the most efficient thermal-emission
-kernel for small and large wavelength grids. It avoids constructing
-wavelength-by-distance arrays during ordinary disk-integrated SED fitting.
-
----
-
 ## Using Stars
 
 ### Load from the catalog
