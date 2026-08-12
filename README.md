@@ -19,7 +19,6 @@ pyGrater is a Python package for computing grain temperatures, scattering/emissi
 - Mie theory grain efficiency calculations (Qabs, Qsca, Qpr)
 - Grain temperature equilibrium as a function of stellar type and distance
 - Optimized SED and image generation for optically thin disks
-- One shared `Fluxes` radiative-transfer implementation for SEDs and images
 - Support for a wide range of grain compositions and stellar spectra
 
 ---
